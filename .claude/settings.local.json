@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d/AI/Claude/**)",
+      "Bash(python scripts/init_db.py)",
+      "Bash(python -c \"import os; print\\(os.path.exists\\('data/raw'\\)\\); print\\(os.listdir\\('data'\\)\\)\")",
+      "Bash(python -)"
+    ]
+  }
+}
