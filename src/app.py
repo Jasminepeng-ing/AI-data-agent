@@ -10,8 +10,8 @@ Streamlit 主程序：AI 数据分析 Agent 的用户界面。
     左侧 Sidebar ── 数据库 Schema 展示 + 文件上传
     右侧主区域 ── 聊天界面（输入框 + 对话历史）
 
-Week 1 状态：LLM 尚未接入，用户输入会被 echo 回来。
-Week 2 计划：将 handle_message() 替换为 DeepSeek API 调用。
+Week 2 状态：NL2SQL 已接入 DeepSeek，流程为：
+    用户提问 → LLM 生成 SQL → 用户确认 → 执行 → 展示结果
 """
 
 import os
@@ -19,12 +19,13 @@ import sys
 import streamlit as st
 
 # ── 路径处理 ──────────────────────────────────────────────────────────────────
-# 把 src/ 加入模块搜索路径，确保无论从哪里启动都能 import data_source
 SRC_DIR      = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SRC_DIR)
 sys.path.insert(0, SRC_DIR)
 
 from data_source import DataSource
+from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, MODEL_NAME, MAX_TOKENS
+from prompts import NL2SQL_SYSTEM_PROMPT, build_nl2sql_prompt, build_fix_prompt
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 DB_PATH = os.path.join(PROJECT_ROOT, "data", "olist.db")
@@ -34,12 +35,11 @@ DB_PATH = os.path.join(PROJECT_ROOT, "data", "olist.db")
 st.set_page_config(
     page_title="AI 数据分析 Agent",
     page_icon="🤖",
-    layout="wide",          # 宽屏布局，聊天区更宽敞
+    layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # 隐藏 file_uploader 内置的文件列表（含 × 按钮），只保留拖拽/选择区域
-# 用 :has() 从有 testid 的子元素向上选中没有 testid 的 <li> 父行，整行隐藏
 st.markdown(
     """
     <style>
@@ -57,71 +57,52 @@ st.markdown(
 # ── 缓存数据库连接 ────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_data_source() -> DataSource:
-    """
-    获取全局唯一的 DataSource 实例。
-
-    用 @st.cache_resource 装饰：
-      - Streamlit 每次用户操作都会重跑整个脚本
-      - 这个装饰器确保数据库连接只建立一次，不会反复开关文件
-      - 类比：就像单例模式，全局共享同一个连接
-
-    Returns
-    -------
-    DataSource
-        已连接好的数据源对象。连接失败时在页面显示错误并停止执行。
-    """
     try:
         return DataSource(DB_PATH)
     except ConnectionError as e:
         st.error(f"❌ 数据库连接失败\n\n{e}")
-        st.stop()  # 连接失败则停止渲染页面，避免后续报错
+        st.stop()
 
 
-# ── 对话处理函数（Week 2 在这里接 LLM）──────────────────────────────────────
-def handle_message(user_input: str, ds: DataSource) -> str:
+# ── LLM 调用 ─────────────────────────────────────────────────────────────────
+def call_llm(user_prompt: str) -> str:
     """
-    处理用户输入，返回 Assistant 的回复文本。
+    调用 DeepSeek API，返回 LLM 的原始文本输出。
 
-    Week 1（当前）：直接 echo 用户输入。
-    Week 2（计划）：把这个函数替换为 DeepSeek API 调用：
-        1. 把 ds.get_schema() 注入 system prompt
-        2. 把 st.session_state.messages 作为历史传入
-        3. 让 LLM 生成 SQL → 调用 ds.query() → 返回结果
-
-    Parameters
-    ----------
-    user_input : str
-        用户在聊天框里输入的文字。
-    ds : DataSource
-        数据源对象，Week 2 用于执行 LLM 生成的 SQL。
-
-    Returns
-    -------
-    str
-        Assistant 要显示的回复文字。
+    始终使用 NL2SQL_SYSTEM_PROMPT 作为系统提示，
+    temperature=0.1 保证 SQL 生成的确定性（低随机性）。
     """
-    # ── Week 1：简单 echo，让页面跑通 ──
-    return f"你说的是：{user_input}"
+    from openai import OpenAI
 
-    # ── Week 2 预留位置（注释保留，届时解注释并删掉上面一行）──
-    # from llm_agent import run_agent
-    # return run_agent(user_input, ds, st.session_state.messages)
+    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": NL2SQL_SYSTEM_PROMPT},
+            {"role": "user",   "content": user_prompt},
+        ],
+        max_tokens=MAX_TOKENS,
+        temperature=0,
+    )
+    return response.choices[0].message.content.strip()
 
 
 # ── 初始化 Session State ──────────────────────────────────────────────────────
 def init_session_state() -> None:
     """
-    初始化 Streamlit session_state 中的所有状态变量。
+    初始化所有 session_state 变量。
 
-    必须在页面渲染前调用，防止首次加载时 KeyError。
-
-    对话历史格式与 DeepSeek / OpenAI API 一致：
-        [{"role": "user",      "content": "..."},
-         {"role": "assistant", "content": "..."}]
-    Week 2 可以直接把这个列表传给 API 的 messages 参数。
+    新增 pending：存储"已生成但等待用户确认"的中间状态。
+    结构：
+        None                          → 无待确认任务
+        {
+          "question": str,            → 用户原始问题
+          "sql":      str,            → LLM 生成的 SQL（可被修复更新）
+          "status":   "confirm"|"error",
+          "error":    str | None,     → SQL 执行错误信息
+        }
     """
     if "messages" not in st.session_state:
-        # 预置一条欢迎消息，让页面不显得空旷
         st.session_state.messages = [
             {
                 "role": "assistant",
@@ -135,27 +116,17 @@ def init_session_state() -> None:
         ]
 
     if "uploaded_tables" not in st.session_state:
-        # 记录已上传的文件名 → 表名映射，Sidebar 展示用
         st.session_state.uploaded_tables = {}
 
     if "deleted_files" not in st.session_state:
-        # 记录"用户主动点击🗑️删除"的文件名集合
-        # 防止 rerun 时 uploader 里残留的文件被当作新文件重新注册
         st.session_state.deleted_files = set()
+
+    if "pending" not in st.session_state:
+        st.session_state.pending = None
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 def render_sidebar(ds: DataSource) -> None:
-    """
-    渲染左侧 Sidebar，包含两个区域：
-      1. 数据库 Schema 展示（可折叠）
-      2. 文件上传组件
-
-    Parameters
-    ----------
-    ds : DataSource
-        数据源对象，用于获取 schema 和注册上传文件。
-    """
     with st.sidebar:
         st.title("📊 数据源管理")
         st.divider()
@@ -163,15 +134,11 @@ def render_sidebar(ds: DataSource) -> None:
         # ── 区域 1：Schema 展示 ──────────────────────────────────────────────
         st.subheader("🗂️ 当前数据表")
 
-        # 用 HTML 渲染两列表名：
-        #   - 精确控制行距，避免 st.columns+caption 自带的大外边距
-        #   - 超过 MAX_LEN 个字符的表名截断显示，鼠标悬浮时 tooltip 显示完整名
         tables = ds.list_tables()
         if tables:
-            MAX_LEN = 19   # 超过此长度则截断
+            MAX_LEN = 19
 
             def make_item(name: str) -> str:
-                """生成单个表名的 HTML 块，含截断显示和 tooltip。"""
                 display = name[:MAX_LEN] + "…" if len(name) > MAX_LEN else name
                 return (
                     f'<div title="{name}" style="cursor:default;white-space:nowrap;'
@@ -179,7 +146,6 @@ def render_sidebar(ds: DataSource) -> None:
                     f'• {display}</div>'
                 )
 
-            # 用 CSS grid 代替 <table>，彻底避开 Streamlit 给表格加边框的问题
             items_html = "".join(make_item(t) for t in tables)
             st.markdown(
                 f'<div style="display:grid;grid-template-columns:1fr 1fr;'
@@ -190,11 +156,8 @@ def render_sidebar(ds: DataSource) -> None:
         else:
             st.caption("（暂无可用数据表）")
 
-        # Schema 详情用 expander 折叠，避免占满整个 Sidebar
         with st.expander("📋 查看完整字段结构", expanded=False):
             try:
-                # 直接查 information_schema，逐表渲染，用 caption 小字显示
-                # 表名和字段之间不插入空行，保持紧凑
                 schema_df = ds.query("""
                     SELECT table_name, column_name, data_type
                     FROM information_schema.columns
@@ -202,16 +165,13 @@ def render_sidebar(ds: DataSource) -> None:
                     ORDER BY table_name, ordinal_position
                 """)
                 for tname, group in schema_df.groupby("table_name", sort=True):
-                    # 字段用 | 分隔，自动换行，不产生横向滚动
                     fields = " | ".join(
                         f"{r['column_name']} *({r['data_type']})*"
                         for _, r in group.iterrows()
                     )
-                    # 表名加粗；字段紧跟其后，无空行
                     st.caption(f"**{tname}**")
                     st.caption(fields)
-            except Exception as e:
-                # 降级回纯文本
+            except Exception:
                 st.caption(ds.get_schema())
 
         st.divider()
@@ -220,9 +180,6 @@ def render_sidebar(ds: DataSource) -> None:
         st.subheader("📁 上传自定义数据")
         st.caption("支持 .csv 和 .xlsx 格式，可同时上传多个文件")
 
-        # ── 已加载文件管理区（放在 uploader 上方，避免被拖拽区域覆盖导致按钮不可点）──
-        # × 号：Streamlit 上传器自带，只从上传队列移除，数据仍在 DuckDB 中可查询
-        # 🗑️ 号：真正从 DuckDB 卸载数据，文件彻底不可查询
         if st.session_state.uploaded_tables:
             st.caption("**已加载文件**（点击 🗑️ 可彻底删除数据）**：**")
             for fname, vname in list(st.session_state.uploaded_tables.items()):
@@ -242,9 +199,6 @@ def render_sidebar(ds: DataSource) -> None:
             label_visibility="collapsed",
         )
 
-        # ── 处理新增文件 ───────────────────────────────────────────────────────
-        # 当文件从 uploader 里物理移除（用户点了 uploader 的 ×），
-        # 同步清掉 deleted_files 里的记录，允许日后重新上传同名文件
         current_filenames = {f.name for f in uploaded_files} if uploaded_files else set()
         st.session_state.deleted_files = {
             f for f in st.session_state.deleted_files if f in current_filenames
@@ -275,71 +229,149 @@ def render_sidebar(ds: DataSource) -> None:
             st.rerun()
 
 
+# ── 渲染单条历史消息 ───────────────────────────────────────────────────────────
+def _render_message(msg: dict) -> None:
+    """渲染一条历史消息，支持附带 SQL 折叠块和 DataFrame 结果表格。"""
+    avatar = "🧑‍💻" if msg["role"] == "user" else "🤖"
+    with st.chat_message(msg["role"], avatar=avatar):
+        st.markdown(msg["content"])
+        if msg.get("sql"):
+            with st.expander("📋 查看 SQL", expanded=False):
+                st.code(msg["sql"], language="sql")
+        if msg.get("dataframe") is not None:
+            st.dataframe(msg["dataframe"], use_container_width=True)
+
+
+# ── 渲染待确认区块 ────────────────────────────────────────────────────────────
+def _render_pending(ds: DataSource) -> None:
+    """
+    渲染"等待用户操作"的 SQL 确认 / 错误修复区块。
+
+    两种状态：
+      confirm → 展示 SQL + [确认执行] [取消]
+      error   → 展示 SQL + 错误信息 + [让AI修复] [取消]
+    """
+    pending = st.session_state.pending
+
+    with st.chat_message("assistant", avatar="🤖"):
+
+        if pending["status"] == "confirm":
+            st.markdown("我已根据你的问题生成了以下 SQL，**请确认后执行**：")
+            with st.expander("📋 查看生成的 SQL", expanded=True):
+                st.code(pending["sql"], language="sql")
+
+            col_ok, col_cancel, _ = st.columns([1.2, 1, 5])
+            with col_ok:
+                if st.button("✅ 确认执行", type="primary", key="btn_confirm"):
+                    try:
+                        df = ds.query(pending["sql"])
+                        st.session_state.messages.append({
+                            "role":      "assistant",
+                            "content":   f"查询完成，共返回 **{len(df):,} 行**数据。",
+                            "sql":       pending["sql"],
+                            "dataframe": df,
+                        })
+                        st.session_state.pending = None
+                    except ValueError as e:
+                        pending["status"] = "error"
+                        pending["error"]  = str(e)
+                    st.rerun()
+
+            with col_cancel:
+                if st.button("❌ 取消", key="btn_cancel_confirm"):
+                    st.session_state.pending = None
+                    st.rerun()
+
+        elif pending["status"] == "error":
+            st.markdown("SQL 执行出错，你可以让 AI 自动修复，或手动取消重新提问。")
+            with st.expander("📋 查看 SQL（执行失败）", expanded=True):
+                st.code(pending["sql"], language="sql")
+            st.error(f"**错误信息：**\n\n```\n{pending['error']}\n```")
+
+            col_fix, col_cancel, _ = st.columns([1.5, 1, 4])
+            with col_fix:
+                if st.button("🔧 让 AI 修复", type="primary", key="btn_fix"):
+                    with st.spinner("AI 正在分析错误并修复 SQL…"):
+                        try:
+                            fix_prompt = build_fix_prompt(
+                                original_sql=pending["sql"],
+                                error_message=pending["error"],
+                                user_question=pending["question"],
+                                schema_text=ds.get_schema(),
+                            )
+                            new_sql = call_llm(fix_prompt)
+                            pending["sql"]    = new_sql
+                            pending["status"] = "confirm"
+                            pending["error"]  = None
+                        except Exception as e:
+                            st.error(f"修复失败：{e}")
+                    st.rerun()
+
+            with col_cancel:
+                if st.button("❌ 取消", key="btn_cancel_error"):
+                    st.session_state.pending = None
+                    st.rerun()
+
 
 # ── 主聊天区域 ────────────────────────────────────────────────────────────────
 def render_chat(ds: DataSource) -> None:
-    """
-    渲染主区域的聊天界面，包含：
-      - 历史消息展示
-      - 底部输入框
-
-    Parameters
-    ----------
-    ds : DataSource
-        数据源对象，传递给 handle_message() 供后续 LLM 调用。
-    """
     st.title("🤖 AI 数据分析 Agent")
-    st.caption("基于 Olist 巴西电商数据集 | Powered by DuckDB + DeepSeek（Week 2 接入）")
+    st.caption("基于 Olist 巴西电商数据集 | Powered by DuckDB + DeepSeek")
     st.divider()
 
-    # ── 渲染历史消息 ──────────────────────────────────────────────────────────
+    # 1. 渲染历史消息
     for msg in st.session_state.messages:
-        # avatar 参数设置头像：user 用人像，assistant 用机器人图标
-        avatar = "🧑‍💻" if msg["role"] == "user" else "🤖"
-        with st.chat_message(msg["role"], avatar=avatar):
-            st.markdown(msg["content"])
+        _render_message(msg)
 
-    # ── 底部输入框 ────────────────────────────────────────────────────────────
+    # 2. 渲染待确认区块（如果有）
+    if st.session_state.pending:
+        _render_pending(ds)
+
+    # 3. 底部输入框
     user_input = st.chat_input(
         placeholder="输入你的问题，例如：各州的订单量分布如何？"
     )
 
-    # 用户提交输入后的处理流程
     if user_input:
+        # 新问题到来，清除上一次未处理的 pending
+        st.session_state.pending = None
 
-        # 1. 把用户消息加入历史，并立即渲染到界面
-        st.session_state.messages.append(
-            {"role": "user", "content": user_input}
-        )
-        with st.chat_message("user", avatar="🧑‍💻"):
-            st.markdown(user_input)
+        # 把用户消息写入历史
+        st.session_state.messages.append({"role": "user", "content": user_input})
 
-        # 2. 生成回复（Week 1 是 echo，Week 2 换成 LLM）
-        with st.chat_message("assistant", avatar="🤖"):
-            # spinner 让用户知道正在处理，Week 2 等待 API 响应时特别有用
-            with st.spinner("思考中..."):
-                try:
-                    reply = handle_message(user_input, ds)
-                except Exception as e:
-                    reply = f"⚠️ 处理出错，请稍后重试。\n\n错误详情：{e}"
+        # 调用 LLM 生成 SQL（spinner 期间页面锁定）
+        with st.spinner("AI 正在分析问题并生成 SQL…"):
+            try:
+                user_prompt = build_nl2sql_prompt(user_input, ds.get_schema())
+                sql = call_llm(user_prompt)
+            except Exception as e:
+                sql = ""
+                api_error = str(e)
+            else:
+                api_error = ""
 
-            st.markdown(reply)
+        if api_error:
+            # API 调用本身失败（网络、密钥等）
+            reply = f"⚠️ 调用 AI 失败，请稍后重试。\n\n错误详情：{api_error}"
+            st.session_state.messages.append({"role": "assistant", "content": reply})
+        elif not sql:
+            # LLM 返回空串（判断无法用 SQL 回答）
+            reply = "这个问题好像不是数据查询类问题，请换一个关于数据分析的问题，我来帮你生成 SQL 😊"
+            st.session_state.messages.append({"role": "assistant", "content": reply})
+        else:
+            # SQL 生成成功，进入"待确认"状态
+            st.session_state.pending = {
+                "question": user_input,
+                "sql":      sql,
+                "status":   "confirm",
+                "error":    None,
+            }
 
-        # 3. 把回复加入历史，下次 rerun 时能重新渲染
-        st.session_state.messages.append(
-            {"role": "assistant", "content": reply}
-        )
+        st.rerun()
 
 
 # ── 程序入口 ──────────────────────────────────────────────────────────────────
 def main() -> None:
-    """
-    App 主入口，按顺序执行：
-      1. 初始化 session state
-      2. 获取数据源
-      3. 渲染 Sidebar
-      4. 渲染聊天区域
-    """
     init_session_state()
     ds = get_data_source()
     render_sidebar(ds)

@@ -243,9 +243,12 @@ response = client.chat.completions.create(
 sql = response.choices[0].message.content
 
 【交付方式】
+- 每写完/修改完先解释这个文件解决了什么问题、关键设计选择和原因
 - 写完后告诉我: 你的 Prompt 工程做了哪些考虑?
 - 为什么 temperature 设 0.1 而不是 0.7?
 - 如果用户问的问题需要 JOIN 多张表,你怎么让 LLM 知道?
+
+写完/修改一个文件后停一下,我跑通了再让你写下一个。
 ```
 
 **✅ Week 1 Day 5-6 完成标志:**
