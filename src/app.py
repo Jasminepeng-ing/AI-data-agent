@@ -38,6 +38,21 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# 隐藏 file_uploader 内置的文件列表（含 × 按钮），只保留拖拽/选择区域
+# 用 :has() 从有 testid 的子元素向上选中没有 testid 的 <li> 父行，整行隐藏
+st.markdown(
+    """
+    <style>
+    [data-testid="stFileUploaderFile"],
+    li:has([data-testid="stFileUploaderFile"]),
+    ul:has([data-testid="stFileUploaderFile"]) {
+        display: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # ── 缓存数据库连接 ────────────────────────────────────────────────────────────
 @st.cache_resource
@@ -205,16 +220,29 @@ def render_sidebar(ds: DataSource) -> None:
         st.subheader("📁 上传自定义数据")
         st.caption("支持 .csv 和 .xlsx 格式，可同时上传多个文件")
 
+        # ── 已加载文件管理区（放在 uploader 上方，避免被拖拽区域覆盖导致按钮不可点）──
+        # × 号：Streamlit 上传器自带，只从上传队列移除，数据仍在 DuckDB 中可查询
+        # 🗑️ 号：真正从 DuckDB 卸载数据，文件彻底不可查询
+        if st.session_state.uploaded_tables:
+            st.caption("**已加载文件**（点击 🗑️ 可彻底删除数据）**：**")
+            for fname, vname in list(st.session_state.uploaded_tables.items()):
+                col_name, col_btn = st.columns([5, 1])
+                display = fname[:22] + "…" if len(fname) > 22 else fname
+                col_name.caption(f"• {display}")
+                if col_btn.button("🗑️", key=f"del_{fname}", help=f"彻底删除「{fname}」的数据"):
+                    ds.unload_view(vname)
+                    del st.session_state.uploaded_tables[fname]
+                    st.session_state.deleted_files.add(fname)
+                    st.rerun()
+
         uploaded_files = st.file_uploader(
             label="选择文件",
             type=["csv", "xlsx"],
-            accept_multiple_files=True,   # 允许同时上传多个文件
-            label_visibility="collapsed", # 隐藏 label，用上方 caption 代替
+            accept_multiple_files=True,
+            label_visibility="collapsed",
         )
 
         # ── 处理新增文件 ───────────────────────────────────────────────────────
-        # uploader 只负责"添加"，删除走下方独立的管理区
-
         # 当文件从 uploader 里物理移除（用户点了 uploader 的 ×），
         # 同步清掉 deleted_files 里的记录，允许日后重新上传同名文件
         current_filenames = {f.name for f in uploaded_files} if uploaded_files else set()
@@ -225,10 +253,8 @@ def render_sidebar(ds: DataSource) -> None:
         newly_loaded = False
         if uploaded_files:
             for file in uploaded_files:
-                # 已注册过的文件跳过，不重复处理
                 if file.name in st.session_state.uploaded_tables:
                     continue
-                # 用户主动删除的文件跳过，防止 rerun 时被当作新文件重新注册
                 if file.name in st.session_state.deleted_files:
                     continue
                 try:
@@ -246,24 +272,7 @@ def render_sidebar(ds: DataSource) -> None:
                     st.error(f"❌ 上传失败：{file.name}\n\n{e}")
 
         if newly_loaded:
-            st.rerun()  # 立即刷新，让上方"当前数据表"出现新表名
-
-        # ── 已加载文件管理区：显示所有已上传文件，每个附带删除按钮 ────────────
-        # 与 uploader 状态完全解耦，刷新页面后仍可管理历史上传文件
-        if st.session_state.uploaded_tables:
-            st.caption("**已加载文件：**")
-            for fname, vname in list(st.session_state.uploaded_tables.items()):
-                col_name, col_btn = st.columns([5, 1])
-                # 文件名截断显示，完整名通过 tooltip 可见
-                display = fname[:22] + "…" if len(fname) > 22 else fname
-                col_name.caption(f"• {display}")
-                # 点击删除按钮：从 DuckDB 卸载视图 + 从 session_state 移除
-                if col_btn.button("🗑️", key=f"del_{fname}", help=f"删除 {fname}"):
-                    ds.unload_view(vname)
-                    del st.session_state.uploaded_tables[fname]
-                    # 标记为"主动删除"，阻止 rerun 时 uploader 残留文件重新注册
-                    st.session_state.deleted_files.add(fname)
-                    st.rerun()  # 立即刷新，上方表名消失
+            st.rerun()
 
 
 
