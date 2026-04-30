@@ -1,0 +1,18 @@
+# 忽略敏感信息
+.env
+
+# 忽略虚拟环境
+.venv/
+venv/
+env/
+
+# 忽略 Python 缓存和临时文件
+__pycache__/
+*.py[cod]
+
+# 忽略数据库文件（如果不想把数据传上网的话）
+*.db
+data/raw/
+
+# 忽略 VS Code 的个人设置
+.vscode/
