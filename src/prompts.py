@@ -30,6 +30,19 @@ NL2SQL_SYSTEM_PROMPT = """\
    不是过滤指令；如需体现在结果中，用 CASE WHEN 做标签列，不要用 WHERE 排除这些值。
 8. 【"X 中"≠ 过滤】用户说"分期付款中…"、"已完成订单中…"等表达，含义是"按该维度分组统计"，
    不是"只保留某个具体值的行"。不得因此添加任何 WHERE 过滤。
+9. 【优先使用 LEFT JOIN】当主表（如 orders）需要关联附属信息表（如 order_payments、order_reviews）时，
+   必须使用 LEFT JOIN，避免因附属表缺失记录而遗漏主表数据。
+   多表链式 JOIN 时，每个附属表都需要单独评估是否用 LEFT JOIN，丢失会逐级传播。
+   只有用户明确要求"只看有支付记录的订单"等场景时，才允许使用 INNER JOIN。
+10. 【禁止多个一对多表同时直接 JOIN（Fan-out 问题）】
+   当需要同时关联多个"一对多"表（例如 order_items 和 order_payments 都与 orders 是一对多关系），
+   严禁直接三表 JOIN，否则行数会按两表的笛卡尔积膨胀，导致 SUM/COUNT 结果虚高。
+   - 错误示范：orders JOIN order_items JOIN order_payments（3商品×2支付=6行，金额被重复累加）
+   - 正确做法：用 WITH 子句或子查询先对各一对多表单独聚合到订单粒度，再分别 LEFT JOIN 主表。
+11. 【NULL 与聚合函数的一致性】使用 LEFT JOIN 后，无匹配行的字段值为 NULL。
+   - SUM、AVG 自动忽略 NULL，结果正确。
+   - COUNT(*) 不忽略 NULL，会把无匹配行也计入总数；应改用 COUNT(附属表的字段) 只统计有值的行。
+   - 当需要将 NULL 显示为 0 时，用 COALESCE(SUM(...), 0)。
 
 【输出格式示例】
 SELECT "order_status", COUNT(*) AS "订单数"

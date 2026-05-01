@@ -26,6 +26,19 @@ OLIST_TABLES = {
     "products", "sellers",
 }
 
+# Olist 数据集表关系说明，以 SQL 注释形式注入 prompt，帮助 LLM 正确编写 JOIN
+OLIST_RELATIONSHIPS = [
+    "-- orders 表通过 customer_id 关联 customers 表",
+    "-- orders 表通过 order_id 关联 order_items 表（一对多）",
+    "-- orders 表通过 order_id 关联 order_payments 表（一对多）",
+    "-- orders 表通过 order_id 关联 order_reviews 表（一对多）",
+    "-- order_items 表通过 product_id 关联 products 表",
+    "-- order_items 表通过 seller_id 关联 sellers 表",
+    "-- products 表通过 product_category_name 关联 product_category_name_translation 表",
+    "-- customers 表通过 customer_zip_code_prefix 关联 geolocation 表（字段名为 geolocation_zip_code_prefix）",
+    "-- sellers 表通过 seller_zip_code_prefix 关联 geolocation 表（字段名为 geolocation_zip_code_prefix）",
+]
+
 
 class DataSource:
     """
@@ -315,6 +328,40 @@ class DataSource:
             load_uploaded_file() 返回的表名。
         """
         self._unregister_view(view_name)
+
+    # ── 增强 Schema（含表关系）────────────────────────────────────────────────
+
+    def get_schema_with_relationships(self) -> str:
+        """
+        返回带表关系注释的 schema 文本，专为 NL2SQL prompt 设计。
+
+        在 get_schema() 基础上，在开头附加 OLIST_RELATIONSHIPS 中定义的
+        表关系说明（SQL 注释格式），帮助 LLM 在涉及多表时选择正确的 JOIN 键。
+
+        对于用户上传的自定义表，只追加基础 schema，不附加关系注释。
+        """
+        rel_text = "\n".join(OLIST_RELATIONSHIPS)
+        schema   = self.get_schema()
+        return f"【表关系说明】\n{rel_text}\n\n【表结构详情】\n{schema}"
+
+    def estimate_row_count(self, sql: str) -> int:
+        """
+        预估 SQL 查询的返回行数，用于在确认卡片中提示用户数据量级。
+
+        实现方式：将原 SQL 包裹在 COUNT(*) 子查询中执行。
+        对于大表 / 复杂 JOIN，此操作本身可能耗时，调用方应在 spinner 内调用。
+
+        Returns
+        -------
+        int
+            预估行数。执行失败时返回 -1（调用方应将 -1 显示为"估算失败"）。
+        """
+        try:
+            count_sql = f"SELECT COUNT(*) AS _cnt FROM ({sql}) AS _subq"
+            result    = self.conn.execute(count_sql).fetchone()
+            return int(result[0]) if result else 0
+        except Exception:
+            return -1
 
     # ── 资源释放 ──────────────────────────────────────────────────────────────
 
