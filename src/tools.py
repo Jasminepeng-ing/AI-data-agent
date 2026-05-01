@@ -131,8 +131,10 @@ def query_database(sql: str, intent: str, ds) -> str:
     """
     执行 SQL，把结果以 intent 为 key 缓存到 session_state['query_results']。
 
-    返回给 LLM 的是文字摘要（行数 + 列名 + 前3行预览），不返回完整 DataFrame，
-    避免占用大量 token。
+    返回给 LLM 的摘要采用动态截断策略：
+    - 结果 ≤ 100 行：全量传给 LLM，Top 10/20/50 等排名查询零幻觉。
+    - 结果 > 100 行：只传前 100 行，附注截断警告，提示 LLM 用 LIMIT/OFFSET 缩小范围。
+    100 行文本约几千 token，对 DeepSeek context window 无压力。
     """
     if not sql or not sql.strip():
         return "错误: SQL 不能为空"
@@ -153,16 +155,26 @@ def query_database(sql: str, intent: str, ds) -> str:
         }
         st.session_state.latest_query_key = intent
 
+        # 小结果集全量传给 LLM（零幻觉）；大结果集才截断并提示
+        MAX_FULL_ROWS = 100
         if df.empty:
-            preview = "（查询返回空结果）"
+            data_text = "（查询返回空结果）"
+            suffix = ""
+        elif len(df) <= MAX_FULL_ROWS:
+            data_text = df.to_string(index=False)
+            suffix = ""
         else:
-            preview = df.head(3).to_string(index=False)
+            data_text = df.head(MAX_FULL_ROWS).to_string(index=False)
+            suffix = (
+                f"\n⚠️ 结果共 {len(df)} 行，已截断至前 {MAX_FULL_ROWS} 行。"
+                f"如需查看特定排名范围，请在 SQL 中使用 LIMIT / OFFSET 控制返回行数。"
+            )
 
         return (
             f"查询完成: {intent}\n"
             f"行数: {len(df)}\n"
             f"列: {', '.join(df.columns)}\n"
-            f"前3行预览:\n{preview}"
+            f"数据:\n{data_text}{suffix}"
         )
 
     except ValueError as e:

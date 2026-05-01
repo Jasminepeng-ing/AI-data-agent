@@ -255,7 +255,20 @@ def render_sidebar(ds: DataSource) -> None:
         if newly_loaded:
             st.rerun()
 
-        # ── 区域 3：本轮已执行查询（Week 2 新增）────────────────────────────
+        # ── 区域 3：历史 SQL 记录 ────────────────────────────────────────────
+        if st.session_state.sql_history:
+            st.divider()
+            st.subheader("🕘 历史 SQL 记录")
+            st.caption("点击 ▶ 可重新提交到 Agent")
+            for i, item in enumerate(st.session_state.sql_history):
+                display = item["question"][:22] + "…" if len(item["question"]) > 22 else item["question"]
+                col_q, col_btn = st.columns([5, 1])
+                col_q.caption(f"• {display}")
+                if col_btn.button("▶", key=f"hist_{i}", help=item["question"]):
+                    st.session_state._replay_question = item["question"]
+                    st.rerun()
+
+        # ── 区域 4：本轮已执行查询（Week 2 新增，始终置于最底部）────────────
         query_results = st.session_state.get("query_results", {})
         if query_results:
             st.divider()
@@ -280,7 +293,6 @@ def render_sidebar(ds: DataSource) -> None:
                     del st.session_state.query_results[last_intent]
                     remaining = list(st.session_state.query_results.keys())
                     st.session_state.latest_query_key = remaining[-1] if remaining else None
-                    # 同步移除最后一条 assistant 消息（若存在）
                     msgs = st.session_state.messages
                     for i in range(len(msgs) - 1, -1, -1):
                         if msgs[i]["role"] == "assistant":
@@ -295,20 +307,6 @@ def render_sidebar(ds: DataSource) -> None:
                 st.code(query_results[show_sql_for]["sql"], language="sql")
                 if st.button("关闭", key="close_sql_panel"):
                     st.session_state._show_sql_for = None
-                    st.rerun()
-
-        # ── 区域 4：历史 SQL 记录 ────────────────────────────────────────────
-        if st.session_state.sql_history:
-            st.divider()
-            st.subheader("🕘 历史 SQL 记录")
-            st.caption("点击 ▶ 可重新提交到 Agent")
-            for i, item in enumerate(st.session_state.sql_history):
-                display = item["question"][:22] + "…" if len(item["question"]) > 22 else item["question"]
-                col_q, col_btn = st.columns([5, 1])
-                col_q.caption(f"• {display}")
-                if col_btn.button("▶", key=f"hist_{i}", help=item["question"]):
-                    # 重新触发 Agent（把问题重新走一遍完整流程）
-                    st.session_state._replay_question = item["question"]
                     st.rerun()
 
 
@@ -395,24 +393,28 @@ def _render_message(msg: dict) -> None:
             st.caption(f"📝 {msg['question']}")
         st.markdown(msg["content"])
 
-        # ── Agent 工具调用记录（可折叠）────────────────────────────────────
-        for step in msg.get("tool_calls_log") or []:
-            tool_name  = step["tool_name"]
-            args       = step["args"]
-            result     = step["result"]
-            intent_hint = (
-                args.get("intent")
-                or args.get("title")
-                or args.get("analysis_type")
-                or tool_name
-            )
-            label = f"🔧 {tool_name}: {intent_hint}"
-            with st.expander(label, expanded=False):
-                if args.get("sql"):
-                    st.code(args["sql"], language="sql")
-                # 截断过长结果，避免撑爆 UI
-                preview = result if len(result) <= 600 else result[:600] + "\n…（已截断）"
-                st.text(preview)
+        # ── Agent 工具调用记录（统一折叠到一个 expander）────────────────────
+        tool_calls = msg.get("tool_calls_log") or []
+        if tool_calls:
+            with st.expander("📋 每一步分析及查询步骤详情", expanded=False):
+                for i, step in enumerate(tool_calls, start=1):
+                    tool_name   = step["tool_name"]
+                    args        = step["args"]
+                    result      = step["result"]
+                    step_num    = step.get("step", i)  # 兼容旧消息（无 step 字段）
+                    intent_hint = (
+                        args.get("intent")
+                        or args.get("title")
+                        or args.get("analysis_type")
+                        or tool_name
+                    )
+                    st.markdown(f"**第 {step_num} 步 🔧 {tool_name}: {intent_hint}**")
+                    if args.get("sql"):
+                        st.code(args["sql"], language="sql")
+                    preview = result if len(result) <= 600 else result[:600] + "\n…（已截断）"
+                    st.text(preview)
+                    if i < len(tool_calls):
+                        st.divider()
 
         # ── 兼容 Week 1 遗留的 sql 字段 ────────────────────────────────────
         if msg.get("sql"):
@@ -586,7 +588,7 @@ def _run_and_store_agent(user_input: str, ds: DataSource) -> None:
     history = st.session_state.messages[:-1]
 
     with st.status("🤖 Agent 正在分析...", expanded=True) as status_box:
-        status_box.write("📖 读取问题，规划工具调用…")
+        status_box.write("📖 读取问题，制定分析计划…")
         agent_result = run_agent(
             user_message=user_input,
             history=history,
@@ -610,18 +612,26 @@ def _run_and_store_agent(user_input: str, ds: DataSource) -> None:
         }
         return
 
-    # 收集本轮 make_chart 生成的 Plotly Figure
-    charts = [item["fig"] for item in st.session_state.get("_agent_charts", [])]
+    # AI 调用失败时不展示任何数据（否则会沿用上一问题的 query_results）
+    is_error = agent_result["final_answer"].startswith("⚠️")
+
+    # 收集本轮 make_chart 生成的 Plotly Figure（失败时清空）
+    charts = (
+        []
+        if is_error
+        else [item["fig"] for item in st.session_state.get("_agent_charts", [])]
+    )
     st.session_state._agent_charts = []
 
-    # 取本轮最新查询结果，供 DataFrame 内联展示
-    latest_key = st.session_state.get("latest_query_key")
-    latest_df  = None
-    if latest_key and latest_key in st.session_state.get("query_results", {}):
-        latest_df = st.session_state["query_results"][latest_key]["df"]
+    # 取本轮最新查询结果，供 DataFrame 内联展示（失败时不取，避免显示上轮数据）
+    latest_df = None
+    if not is_error:
+        latest_key = st.session_state.get("latest_query_key")
+        if latest_key and latest_key in st.session_state.get("query_results", {}):
+            latest_df = st.session_state["query_results"][latest_key]["df"]
 
-    # 把 SQL 写入历史记录（取 tool_calls_log 里 query_database 的 SQL）
-    for step in agent_result["tool_calls_log"]:
+    # 把 SQL 写入历史记录（失败时不写；取 tool_calls_log 里 query_database 的 SQL）
+    for step in ([] if is_error else agent_result["tool_calls_log"]):
         if step["tool_name"] == "query_database":
             entry = {"question": user_input, "sql": step["args"].get("sql", "")}
             history_list = st.session_state.sql_history

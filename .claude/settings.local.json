@@ -7,7 +7,8 @@
       "Bash(python -)",
       "Bash(cd /d \"D:\\\\AI\\\\Claude\\\\AI-data-agent\")",
       "Bash(python -c ' *)",
-      "Bash(python -c \"import sys; sys.path.insert\\(0, 'D:/AI/Claude/AI-data-agent/src'\\); from config import LARGE_QUERY_ROW_THRESHOLD; from tools import TOOLS_SCHEMA; from agent import should_confirm, MAX_ITERATIONS; names=[t['function']['name'] for t in TOOLS_SCHEMA]; print\\('OK'\\); print\\('tools:', names\\); print\\('MAX_ITER:', MAX_ITERATIONS\\); print\\('threshold:', LARGE_QUERY_ROW_THRESHOLD\\); print\\('confirm_50k:', should_confirm\\('',50000\\)\\); print\\('confirm_150k:', should_confirm\\('',150000\\)\\)\")"
+      "Bash(python -c \"import sys; sys.path.insert\\(0, 'D:/AI/Claude/AI-data-agent/src'\\); from config import LARGE_QUERY_ROW_THRESHOLD; from tools import TOOLS_SCHEMA; from agent import should_confirm, MAX_ITERATIONS; names=[t['function']['name'] for t in TOOLS_SCHEMA]; print\\('OK'\\); print\\('tools:', names\\); print\\('MAX_ITER:', MAX_ITERATIONS\\); print\\('threshold:', LARGE_QUERY_ROW_THRESHOLD\\); print\\('confirm_50k:', should_confirm\\('',50000\\)\\); print\\('confirm_150k:', should_confirm\\('',150000\\)\\)\")",
+      "Bash(pip install *)"
     ]
   }
 }

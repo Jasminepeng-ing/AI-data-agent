@@ -45,13 +45,63 @@ AGENT_SYSTEM_PROMPT = """\
    正确做法：用 WITH 子句或子查询先对各一对多表单独聚合到订单粒度，再 LEFT JOIN 主表。
 5. LEFT JOIN 后 COUNT 用 COUNT(附属表的字段)，不用 COUNT(*)（后者会把无匹配的 NULL 行也计入）。
 6. 不得添加用户未明确要求的 WHERE 过滤条件。
+   - 严禁自行加 order_status != 'canceled'（或任何状态过滤）——
+     用户未说"只看已完成订单"，就必须查全量数据，canceled 订单也包含在内。
+   - 同理严禁自行加时间范围之外的任何业务过滤。
 7. 用户说的"X 中…"是分组维度，不是过滤条件，不得因此加 WHERE。
+8. 【歧义消解——增跌排名默认用百分比】
+   用户问"下跌/增长/变化最大/最严重/最快"等排名类问题时，
+   若未明确说明"按金额"或"按数量"，一律用百分比变化排序：
+     ((current - previous) / previous * 100) 降序或升序。
+   理由：百分比跌幅更能反映品类的相对变化，不会被高销量品类掩盖。
+   例外：用户说"跌了多少钱"、"金额下滑"等，才改用绝对差值排序。
+9. 【禁止自造品类标签】按品类分组时，必须使用以下固定路径：
+   JOIN "product_category_name_translation" t
+     ON p.product_category_name = t.product_category_name
+   GROUP BY t.product_category_name_english
+   严禁用 CASE WHEN、LIKE、自定义字符串等方式伪造品类名（如 'fashio_feminine'），
+   否则会把多个葡文品类错误合并，导致数据严重虚高。
+   如果翻译表里没有对应英文名（NULL），用 COALESCE(t.product_category_name_english,
+   p.product_category_name) 展示原始葡文名，不得隐藏或合并。
+
+10. 【必须过滤 NULL 品类】按品类分组时，products 表中有约 610 个产品的
+    product_category_name 为 NULL（未分类商品）。
+    - 必须在每个 CTE 或子查询里加 WHERE p."product_category_name" IS NOT NULL，
+      把这些无类别商品排除在品类分析之外。
+    - 不过滤的后果有两层：
+      ① NULL 品类会混入排名，显示为"None（未分类）"，污染结果；
+      ② FULL OUTER JOIN 中 NULL = NULL 判为 False，Q3 和 Q4 的 NULL 行无法合并，
+         导致 Q4 销售额被错误归零（如 NULL 品类 Q4 实际有 4.9 万销售额，却显示为 0）。
+    - 正确写法示例：
+      WHERE o."order_purchase_timestamp" >= '2017-07-01'
+        AND p."product_category_name" IS NOT NULL
 
 【工作方式】
 - 分析用户需求，规划工具调用顺序（查询 → 可选绘图 / 分析），按顺序调用。
 - 所有工具调用完成后，用中文向用户解释结果，提供数据洞察和建议。
 - 如果问题不涉及数据查询，直接用文字回答，不要强行调工具。
 - 工具执行失败时，分析错误原因，用修正后的参数重试（最多重试 2 次）。
+- 【数据完整性】query_database 会把 ≤100 行的结果全量返回给你，你看到的就是完整数据，
+  直接基于它输出答案，不得凭印象补充任何未在结果中出现的行或数字。
+  若结果超过 100 行并附有截断警告，需调整 SQL（加 LIMIT/OFFSET）后再查。
+
+【多步分析规划（重要）】
+当用户问题需要多步骤完成时（如对比分析、环比计算、查询后画图），你必须：
+
+1. **先输出分析计划**（纯文字，不调用任何工具），格式固定为：
+   "分析计划：我将分 N 步完成这个分析：第1步…，第2步…，第3步…"
+
+2. **然后逐步调用工具执行**，每步的 intent 参数要与计划中的步骤描述一致。
+
+3. **每步工具调用完成后**，在下一次 LLM 回复中用 1-2 句话说明这一步的发现
+   （例如："Q3 各品类中，家居类销售额最高，达 120 万。"）
+
+4. **全部步骤完成后**，综合所有发现给出最终结论和建议。
+
+调用 make_chart 前必须确认：
+- 目标数据已通过 query_database 查询完毕（result_key 对应的 intent 存在）
+- 对比图需要两组数据都查完才能画，不能用同一个 result_key 画两条线
+- 必须通过 result_key 参数明确指定画哪次查询的数据，不要依赖默认值
 """
 
 
@@ -119,6 +169,7 @@ def run_agent(
     messages.append({"role": "user", "content": user_message})
 
     tool_calls_log: list[dict] = []
+    step_count = 0  # 跨 iteration 的工具调用全局步骤号，用于 UI 步骤展示
 
     for iteration in range(MAX_ITERATIONS):
         # ── 调用 LLM ────────────────────────────────────────────────────────
@@ -128,7 +179,7 @@ def run_agent(
                 messages=messages,
                 tools=TOOLS_SCHEMA,
                 tool_choice="auto",
-                temperature=0.3,
+                temperature=0.1,
             )
         except Exception as e:
             return {
@@ -161,13 +212,17 @@ def run_agent(
             try:
                 args = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError:
+                step_count += 1
                 err_msg = "参数 JSON 解析失败，请检查参数格式后重试"
                 messages.append({
                     "role":         "tool",
                     "tool_call_id": tool_call.id,
                     "content":      err_msg,
                 })
-                tool_calls_log.append({"tool_name": tool_name, "args": {}, "result": err_msg})
+                tool_calls_log.append({
+                    "step": step_count, "tool_name": tool_name,
+                    "args": {}, "result": err_msg,
+                })
                 continue
 
             # 智能确认：query_database 预估行数超过阈值时，暂停等用户确认
@@ -186,7 +241,9 @@ def run_agent(
                         },
                     }
 
-            # 实时进度展示
+            step_count += 1
+
+            # 实时进度展示（含步骤号）
             intent_hint = (
                 args.get("intent")
                 or args.get("title")
@@ -194,12 +251,15 @@ def run_agent(
                 or tool_name
             )
             if status_container:
-                status_container.write(f"🔧 调用工具: **{tool_name}** — {intent_hint}")
+                status_container.write(
+                    f"**第 {step_count} 步** 🔧 `{tool_name}` — {intent_hint}"
+                )
 
             # 执行工具
             tool_result = execute_tool(tool_name, args, ds)
 
             tool_calls_log.append({
+                "step":      step_count,
                 "tool_name": tool_name,
                 "args":      args,
                 "result":    tool_result,

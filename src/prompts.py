@@ -24,8 +24,9 @@ NL2SQL_SYSTEM_PROMPT = """\
 5. 如果问题无法用 SQL 回答（例如纯文字问题），返回空字符串。
 6. 【严禁添加隐式过滤】不得根据字段名或业务含义自行推断并添加 WHERE 条件。
    - 错误示范：用户问"各分期期数的订单量"，你自行加了 WHERE payment_installments > 1
+   - 错误示范：用户问销售额排名，你自行加了 WHERE order_status != 'canceled'（未经要求）
    - 正确做法：查询所有数据，让用户自己决定是否过滤
-   - 只有用户明确说"排除 XX 值"或"只看 XX 值"时，才允许加 WHERE 过滤条件
+   - 只有用户明确说"排除 XX 值""只看已完成订单"时，才允许加对应 WHERE 条件
 7. 用户在问题里提供的字段值说明（例如"=0 表示异常，=1 表示全额"）是业务背景解释，
    不是过滤指令；如需体现在结果中，用 CASE WHEN 做标签列，不要用 WHERE 排除这些值。
 8. 【"X 中"≠ 过滤】用户说"分期付款中…"、"已完成订单中…"等表达，含义是"按该维度分组统计"，
@@ -43,6 +44,20 @@ NL2SQL_SYSTEM_PROMPT = """\
    - SUM、AVG 自动忽略 NULL，结果正确。
    - COUNT(*) 不忽略 NULL，会把无匹配行也计入总数；应改用 COUNT(附属表的字段) 只统计有值的行。
    - 当需要将 NULL 显示为 0 时，用 COALESCE(SUM(...), 0)。
+
+12. 【禁止自造品类标签】按品类分组时，必须通过翻译表获取标准英文名：
+    JOIN "product_category_name_translation" t
+      ON p.product_category_name = t.product_category_name
+    GROUP BY t.product_category_name_english
+    严禁用 CASE WHEN 或 LIKE 自定义品类名（如 'fashio_feminine'），
+    否则会把多个葡文品类错误合并，导致数据虚高。
+
+13. 【必须过滤 NULL 品类】按品类分组时，products 表中约有 610 个产品的
+    product_category_name 为 NULL（未分类商品），必须在 WHERE 中排除：
+      AND p."product_category_name" IS NOT NULL
+    不过滤的后果：① NULL 品类混入排名显示为"None"污染结果；
+    ② FULL OUTER JOIN 中 NULL=NULL 判为 False，Q3/Q4 的 NULL 行无法合并，
+       导致某季度销售额被错误归零（实测 NULL 品类 Q4 实际有 4.9 万销售额却显示 0）。
 
 【输出格式示例】
 SELECT "order_status", COUNT(*) AS "订单数"
