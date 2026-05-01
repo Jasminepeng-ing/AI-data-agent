@@ -7,16 +7,20 @@ Streamlit 主程序：AI 数据分析 Agent 的用户界面。
     streamlit run src/app.py
 
 页面结构：
-    左侧 Sidebar ── 数据库 Schema 展示 + 文件上传
-    右侧主区域 ── 聊天界面（输入框 + 对话历史）
+    左侧 Sidebar ── 数据源管理 + 本轮已执行查询（含撤销）+ 历史 SQL 记录
+    右侧主区域 ── 聊天界面（Agent 进度 + 对话历史）
 
-Week 2 状态：NL2SQL 已接入 DeepSeek，流程为：
-    用户提问 → LLM 生成 SQL → 用户确认 → 执行 → 展示结果
+Week 2 架构：
+    用户提问 → run_agent() 自动规划工具调用 → 展示 Agent 思考过程
+    → 工具执行结果（查询/图表/分析）→ LLM 最终回答
+    只有预估行数 > 10 万的查询才弹确认框（智能确认）。
 """
 
 import os
 import re
 import sys
+from datetime import datetime
+
 import pandas as pd
 import streamlit as st
 
@@ -27,7 +31,8 @@ sys.path.insert(0, SRC_DIR)
 
 from data_source import DataSource
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, MODEL_NAME, MAX_TOKENS
-from prompts import NL2SQL_SYSTEM_PROMPT, build_nl2sql_prompt, build_fix_prompt
+from prompts import build_fix_prompt
+from agent import run_agent
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 DB_PATH = os.path.join(PROJECT_ROOT, "data", "olist.db")
@@ -66,22 +71,21 @@ def get_data_source() -> DataSource:
         st.stop()
 
 
-# ── LLM 调用 ─────────────────────────────────────────────────────────────────
-def call_llm(user_prompt: str) -> str:
+# ── LLM 调用（仅用于 pending error 状态的 SQL 修复）──────────────────────────
+def call_llm_for_fix(fix_prompt: str) -> str:
     """
-    调用 DeepSeek API，返回 LLM 的原始文本输出。
-
-    始终使用 NL2SQL_SYSTEM_PROMPT 作为系统提示，
-    temperature=0.1 保证 SQL 生成的确定性（低随机性）。
+    调用 DeepSeek 修复执行失败的 SQL。
+    仅在大查询确认后执行出错时使用，正常查询路径通过 run_agent() 处理。
     """
     from openai import OpenAI
+    from prompts import NL2SQL_SYSTEM_PROMPT
 
     client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
     response = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
             {"role": "system", "content": NL2SQL_SYSTEM_PROMPT},
-            {"role": "user",   "content": user_prompt},
+            {"role": "user",   "content": fix_prompt},
         ],
         max_tokens=MAX_TOKENS,
         temperature=0,
@@ -89,21 +93,7 @@ def call_llm(user_prompt: str) -> str:
     return response.choices[0].message.content.strip()
 
 
-# ── SQL 执行策略 ──────────────────────────────────────────────────────────────
-def should_confirm(sql: str, estimated_rows: int) -> bool:
-    """
-    判断是否需要向用户展示确认卡片再执行。
-
-    Week 1：始终返回 True（所有查询都要确认）。
-
-    Week 2 升级方式（只改这一处）：
-        from config import LARGE_QUERY_ROW_THRESHOLD
-        return estimated_rows < 0 or estimated_rows > LARGE_QUERY_ROW_THRESHOLD
-        # estimated_rows=-1 表示估算失败，保守起见也要确认
-    """
-    return True
-
-
+# ── SQL 元信息解析（用于确认卡片）────────────────────────────────────────────
 def _parse_sql_meta(sql: str) -> dict:
     """从 SQL 文本解析涉及的表名和是否包含 JOIN，用于确认卡片展示。"""
     pattern = r'(?:FROM|JOIN)\s+"?(\w+)"?'
@@ -117,15 +107,14 @@ def init_session_state() -> None:
     """
     初始化所有 session_state 变量。
 
-    新增 pending：存储"已生成但等待用户确认"的中间状态。
-    结构：
-        None                          → 无待确认任务
-        {
-          "question": str,            → 用户原始问题
-          "sql":      str,            → LLM 生成的 SQL（可被修复更新）
-          "status":   "confirm"|"error",
-          "error":    str | None,     → SQL 执行错误信息
-        }
+    新增 Week 2 字段：
+        query_results     : {intent -> {df, sql, intent, timestamp, row_count, columns}}
+        latest_query_key  : str，最近一次 query_database 的 intent，供 make_chart 等默认使用
+        _agent_charts     : list of {fig, title}，本轮 make_chart 生成的 Figure 暂存区
+
+    pending 结构（Week 2 只在大查询时触发）：
+        None                          → 无待处理任务
+        {"question", "sql", "intent", "status": "confirm"/"error", "error", "estimated_rows"}
     """
     if "messages" not in st.session_state:
         st.session_state.messages = [
@@ -150,7 +139,17 @@ def init_session_state() -> None:
         st.session_state.pending = None
 
     if "sql_history" not in st.session_state:
-        st.session_state.sql_history = []  # 每项：{"question": str, "sql": str}
+        st.session_state.sql_history = []  # [{question, sql}, ...]
+
+    # Week 2 新增
+    if "query_results" not in st.session_state:
+        st.session_state.query_results = {}  # {intent -> {df, sql, ...}}
+
+    if "latest_query_key" not in st.session_state:
+        st.session_state.latest_query_key = None
+
+    if "_agent_charts" not in st.session_state:
+        st.session_state._agent_charts = []
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -256,27 +255,60 @@ def render_sidebar(ds: DataSource) -> None:
         if newly_loaded:
             st.rerun()
 
-        # ── 区域 3：最近查询历史 ─────────────────────────────────────────────
+        # ── 区域 3：本轮已执行查询（Week 2 新增）────────────────────────────
+        query_results = st.session_state.get("query_results", {})
+        if query_results:
+            st.divider()
+            st.subheader("🔎 本轮已执行查询")
+            st.caption("Agent 本次会话中执行的查询，点击 📋 查看 SQL")
+
+            # 按时间倒序展示（字典插入顺序即时间顺序）
+            items = list(query_results.items())[::-1]
+            for intent, info in items:
+                display = intent[:20] + "…" if len(intent) > 20 else intent
+                col_intent, col_detail = st.columns([5, 1])
+                col_intent.caption(f"• {display}（{info['row_count']} 行）")
+                with col_detail:
+                    if st.button("📋", key=f"qr_{intent}", help=f"查看 SQL: {intent}"):
+                        st.session_state._show_sql_for = intent
+                        st.rerun()
+
+            # 撤销最后一步查询
+            if st.button("↩️ 撤销上一步查询", use_container_width=True):
+                if items:
+                    last_intent = items[0][0]
+                    del st.session_state.query_results[last_intent]
+                    remaining = list(st.session_state.query_results.keys())
+                    st.session_state.latest_query_key = remaining[-1] if remaining else None
+                    # 同步移除最后一条 assistant 消息（若存在）
+                    msgs = st.session_state.messages
+                    for i in range(len(msgs) - 1, -1, -1):
+                        if msgs[i]["role"] == "assistant":
+                            msgs.pop(i)
+                            break
+                    st.rerun()
+
+        # 展示被点击的 SQL（悬浮在 sidebar 内的 expander）
+        show_sql_for = st.session_state.get("_show_sql_for")
+        if show_sql_for and show_sql_for in query_results:
+            with st.expander(f"📋 SQL: {show_sql_for}", expanded=True):
+                st.code(query_results[show_sql_for]["sql"], language="sql")
+                if st.button("关闭", key="close_sql_panel"):
+                    st.session_state._show_sql_for = None
+                    st.rerun()
+
+        # ── 区域 4：历史 SQL 记录 ────────────────────────────────────────────
         if st.session_state.sql_history:
             st.divider()
-            st.subheader("🕘 最近查询")
-            st.caption("点击 ▶ 可重新执行")
+            st.subheader("🕘 历史 SQL 记录")
+            st.caption("点击 ▶ 可重新提交到 Agent")
             for i, item in enumerate(st.session_state.sql_history):
                 display = item["question"][:22] + "…" if len(item["question"]) > 22 else item["question"]
                 col_q, col_btn = st.columns([5, 1])
                 col_q.caption(f"• {display}")
                 if col_btn.button("▶", key=f"hist_{i}", help=item["question"]):
-                    try:
-                        est = ds.estimate_row_count(item["sql"])
-                    except Exception:
-                        est = -1
-                    st.session_state.pending = {
-                        "question":      item["question"],
-                        "sql":           item["sql"],
-                        "status":        "confirm",
-                        "error":         None,
-                        "estimated_rows": est,
-                    }
+                    # 重新触发 Agent（把问题重新走一遍完整流程）
+                    st.session_state._replay_question = item["question"]
                     st.rerun()
 
 
@@ -299,14 +331,6 @@ def _render_dataframe_with_total(df: pd.DataFrame) -> None:
     """
     将合计行直接拼接到主表末尾，渲染为同一个 st.dataframe 的最后一行。
     合计行用浅蓝背景高亮，下载时一并导出。
-
-    数字格式规则（优先级从高到低）：
-      · 金额浮点列：千位符 + 2 位小数，如 25,000.00
-      · 金额整数列：千位符，如 25,000
-      · 普通浮点列：2 位小数，如 0.51
-      · 普通整数列：原样显示
-
-    跳过合计的情况：无数值列、结果仅 1 行（避免重复展示相同数值）。
     """
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
     float_cols   = df.select_dtypes(include="float").columns.tolist()
@@ -316,7 +340,6 @@ def _render_dataframe_with_total(df: pd.DataFrame) -> None:
         st.dataframe(df, use_container_width=True)
         return
 
-    # ① 构建合计行
     total: dict = {}
     for i, col in enumerate(df.columns):
         if i == 0:
@@ -325,20 +348,14 @@ def _render_dataframe_with_total(df: pd.DataFrame) -> None:
             total[col] = df[col].sum()
         else:
             total[col] = "—"
-    total_df = pd.DataFrame([total])
+    total_df  = pd.DataFrame([total])
+    combined  = pd.concat([df, total_df], ignore_index=True)
 
-    # ② 拼接为单表（合计在最后一行）
-    combined = pd.concat([df, total_df], ignore_index=True)
-
-    # ③ 高亮合计行（最后一行浅蓝背景）
     def _style_total(frame: pd.DataFrame) -> pd.DataFrame:
         styles = pd.DataFrame("", index=frame.index, columns=frame.columns)
         styles.iloc[-1] = "background-color: #dbe4f5"
         return styles
 
-    # ④ 按列类型 + 是否金额列决定格式
-    # 使用 callable formatter 而非格式字符串，避免合计行字符串值触发
-    # "Cannot specify ',' with 's'" —— 字符串值直接原样返回
     def _safe_float(is_amount: bool):
         if is_amount:
             return lambda x: f"{x:,.2f}" if isinstance(x, (int, float)) and pd.notna(x) else str(x)
@@ -365,38 +382,70 @@ def _render_dataframe_with_total(df: pd.DataFrame) -> None:
 
 # ── 渲染单条历史消息 ───────────────────────────────────────────────────────────
 def _render_message(msg: dict) -> None:
-    """渲染一条历史消息，支持附带 SQL 折叠块和 DataFrame 结果表格。"""
+    """
+    渲染一条历史消息。
+
+    Week 2 新增字段：
+        tool_calls_log : [{tool_name, args, result}]，每个工具调用展示为折叠块
+        charts         : [plotly Figure]，依次渲染图表
+    """
     avatar = "🧑‍💻" if msg["role"] == "user" else "🤖"
     with st.chat_message(msg["role"], avatar=avatar):
         if msg.get("question"):
             st.caption(f"📝 {msg['question']}")
         st.markdown(msg["content"])
+
+        # ── Agent 工具调用记录（可折叠）────────────────────────────────────
+        for step in msg.get("tool_calls_log") or []:
+            tool_name  = step["tool_name"]
+            args       = step["args"]
+            result     = step["result"]
+            intent_hint = (
+                args.get("intent")
+                or args.get("title")
+                or args.get("analysis_type")
+                or tool_name
+            )
+            label = f"🔧 {tool_name}: {intent_hint}"
+            with st.expander(label, expanded=False):
+                if args.get("sql"):
+                    st.code(args["sql"], language="sql")
+                # 截断过长结果，避免撑爆 UI
+                preview = result if len(result) <= 600 else result[:600] + "\n…（已截断）"
+                st.text(preview)
+
+        # ── 兼容 Week 1 遗留的 sql 字段 ────────────────────────────────────
         if msg.get("sql"):
             with st.expander("📋 查看 SQL", expanded=False):
                 st.code(msg["sql"], language="sql")
+
+        # ── 查询结果 DataFrame ───────────────────────────────────────────────
         if msg.get("dataframe") is not None:
             _render_dataframe_with_total(msg["dataframe"])
+
+        # ── 图表（Week 2）────────────────────────────────────────────────────
+        for chart in msg.get("charts") or []:
+            st.plotly_chart(chart, use_container_width=True)
 
 
 # ── 渲染待确认区块 ────────────────────────────────────────────────────────────
 def _render_pending(ds: DataSource) -> None:
     """
-    渲染"等待用户操作"的 SQL 确认 / 错误修复区块。
-
-    confirm 状态展示：查询意图 + 元信息卡片（表名、JOIN、预估行数）+ SQL + 按钮
-    error   状态展示：SQL + 错误信息 + [让 AI 修复] [取消]
+    Week 2 的 pending 只在两种情况出现：
+      confirm — Agent 检测到大数据量查询（> 10万行），暂停等用户确认
+      error   — 大查询确认执行后 SQL 报错，可让 AI 修复
     """
     pending = st.session_state.pending
 
     with st.chat_message("assistant", avatar="🤖"):
 
         if pending["status"] == "confirm":
-            st.markdown("我已根据你的问题生成了以下 SQL，**请确认后执行**：")
+            st.markdown(
+                "⚠️ 这个查询预估返回数据量较大，**请确认后再执行**："
+            )
 
-            # ── 查询意图 ───────────────────────────────────────────────────────
-            st.markdown(f"**📝 查询意图：** {pending['question']}")
+            st.markdown(f"**📝 查询意图：** {pending.get('intent', pending['question'])}")
 
-            # ── 元信息卡片 ─────────────────────────────────────────────────────
             meta = _parse_sql_meta(pending["sql"])
             est  = pending.get("estimated_rows", -1)
 
@@ -408,24 +457,37 @@ def _render_pending(ds: DataSource) -> None:
             else:
                 c3.markdown("**📊 预估行数：** 估算失败")
 
-            # ── SQL 预览 ───────────────────────────────────────────────────────
             with st.expander("📋 查看生成的 SQL", expanded=True):
                 st.code(pending["sql"], language="sql")
 
-            # ── 操作按钮 ───────────────────────────────────────────────────────
             col_ok, col_cancel, _ = st.columns([1.2, 1, 5])
             with col_ok:
                 if st.button("✅ 确认执行", type="primary", key="btn_confirm"):
                     try:
-                        df = ds.query(pending["sql"])
-                        st.session_state.messages.append({
-                            "role":      "assistant",
-                            "content":   f"查询完成，共返回 **{len(df):,} 行**数据。",
-                            "question":  pending["question"],
+                        df      = ds.query(pending["sql"])
+                        intent  = pending.get("intent", pending["question"])
+
+                        # 存入 query_results，供后续工具引用
+                        st.session_state.query_results[intent] = {
+                            "df":        df,
                             "sql":       pending["sql"],
-                            "dataframe": df,
+                            "intent":    intent,
+                            "timestamp": datetime.now().isoformat(),
+                            "row_count": len(df),
+                            "columns":   list(df.columns),
+                        }
+                        st.session_state.latest_query_key = intent
+
+                        st.session_state.messages.append({
+                            "role":           "assistant",
+                            "content":        f"（大数据量查询已确认）共返回 **{len(df):,} 行**数据。",
+                            "question":       pending["question"],
+                            "sql":            pending["sql"],
+                            "dataframe":      df,
+                            "tool_calls_log": [],
+                            "charts":         [],
                         })
-                        # 写入最近查询历史（去重 + 最多保留 10 条）
+                        # 写入历史 SQL 记录（去重 + 最多 10 条）
                         entry = {"question": pending["question"], "sql": pending["sql"]}
                         history = st.session_state.sql_history
                         if entry not in history:
@@ -444,7 +506,7 @@ def _render_pending(ds: DataSource) -> None:
                     st.rerun()
 
         elif pending["status"] == "error":
-            st.markdown("SQL 执行出错，你可以让 AI 自动修复，或手动取消重新提问。")
+            st.markdown("SQL 执行出错，可以让 AI 自动修复，或手动取消重新提问。")
             with st.expander("📋 查看 SQL（执行失败）", expanded=True):
                 st.code(pending["sql"], language="sql")
             st.error(f"**错误信息：**\n\n```\n{pending['error']}\n```")
@@ -460,10 +522,10 @@ def _render_pending(ds: DataSource) -> None:
                                 user_question=pending["question"],
                                 schema_text=ds.get_schema_with_relationships(),
                             )
-                            new_sql = call_llm(fix_prompt)
-                            pending["sql"]           = new_sql
-                            pending["status"]        = "confirm"
-                            pending["error"]         = None
+                            new_sql = call_llm_for_fix(fix_prompt)
+                            pending["sql"]            = new_sql
+                            pending["status"]         = "confirm"
+                            pending["error"]          = None
                             pending["estimated_rows"] = ds.estimate_row_count(new_sql)
                         except Exception as e:
                             st.error(f"修复失败：{e}")
@@ -478,82 +540,105 @@ def _render_pending(ds: DataSource) -> None:
 # ── 主聊天区域 ────────────────────────────────────────────────────────────────
 def render_chat(ds: DataSource) -> None:
     st.title("🤖 AI 数据分析 Agent")
-    st.caption("基于 Olist 巴西电商数据集 | Powered by DuckDB + DeepSeek")
+    st.caption("基于 Olist 巴西电商数据集 | Powered by DuckDB + DeepSeek Function Calling")
     st.divider()
 
     # 1. 渲染历史消息
     for msg in st.session_state.messages:
         _render_message(msg)
 
-    # 2. 渲染待确认区块（如果有）
+    # 2. 渲染待确认区块（仅大查询时触发）
     if st.session_state.pending:
         _render_pending(ds)
 
-    # 3. 底部输入框
+    # 3. 历史记录回放（sidebar ▶ 按钮触发）
+    if "_replay_question" in st.session_state:
+        replay_q = st.session_state["_replay_question"]
+        del st.session_state["_replay_question"]  # 先删除，防止下次 rerun 重复触发
+        st.session_state.messages.append({"role": "user", "content": replay_q})
+        _run_and_store_agent(replay_q, ds)
+        st.rerun()
+
+    # 4. 底部输入框
     user_input = st.chat_input(
         placeholder="输入你的问题，例如：各州的订单量分布如何？"
     )
 
     if user_input:
-        # 新问题到来，清除上一次未处理的 pending
-        st.session_state.pending = None
-
-        # 把用户消息写入历史
+        st.session_state.pending    = None
+        st.session_state._agent_charts = []
         st.session_state.messages.append({"role": "user", "content": user_input})
-
-        # 调用 LLM 生成 SQL + 预估行数（同一 spinner 内完成）
-        with st.spinner("AI 正在分析问题并生成 SQL…"):
-            try:
-                user_prompt = build_nl2sql_prompt(
-                    user_input, ds.get_schema_with_relationships()
-                )
-                sql = call_llm(user_prompt)
-            except Exception as e:
-                sql = ""
-                api_error = str(e)
-            else:
-                api_error = ""
-
-            # 行数估算（LLM 成功后紧接着做，失败不阻断流程）
-            estimated_rows = -1
-            if sql and not api_error:
-                try:
-                    estimated_rows = ds.estimate_row_count(sql)
-                except Exception:
-                    estimated_rows = -1
-
-        if api_error:
-            reply = f"⚠️ 调用 AI 失败，请稍后重试。\n\n错误详情：{api_error}"
-            st.session_state.messages.append({"role": "assistant", "content": reply})
-        elif not sql:
-            reply = "这个问题好像不是数据查询类问题，请换一个关于数据分析的问题，我来帮你生成 SQL 😊"
-            st.session_state.messages.append({"role": "assistant", "content": reply})
-        elif should_confirm(sql, estimated_rows):
-            # 需要用户确认：进入 pending 状态
-            st.session_state.pending = {
-                "question":       user_input,
-                "sql":            sql,
-                "status":         "confirm",
-                "error":          None,
-                "estimated_rows": estimated_rows,
-            }
-        else:
-            # Week 2 直接执行分支（当前 should_confirm 恒为 True，不会走到这里）
-            try:
-                df = ds.query(sql)
-                st.session_state.messages.append({
-                    "role":      "assistant",
-                    "content":   f"查询完成，共返回 **{len(df):,} 行**数据。",
-                    "sql":       sql,
-                    "dataframe": df,
-                })
-            except ValueError as e:
-                st.session_state.messages.append({
-                    "role":    "assistant",
-                    "content": f"❌ SQL 执行失败：{e}",
-                })
-
+        _run_and_store_agent(user_input, ds)
         st.rerun()
+
+
+def _run_and_store_agent(user_input: str, ds: DataSource) -> None:
+    """
+    调用 run_agent()，把结果（回答、工具日志、图表）存入 session_state.messages。
+    如果 Agent 检测到大查询，设置 pending 状态等待用户确认。
+
+    独立抽取为函数是为了让 render_chat 和历史回放都能复用同一套逻辑。
+    """
+    # 清空本轮图表暂存区
+    st.session_state._agent_charts = []
+
+    # 取历史（不含本轮 user 消息）
+    history = st.session_state.messages[:-1]
+
+    with st.status("🤖 Agent 正在分析...", expanded=True) as status_box:
+        status_box.write("📖 读取问题，规划工具调用…")
+        agent_result = run_agent(
+            user_message=user_input,
+            history=history,
+            ds=ds,
+            status_container=status_box,
+        )
+        if agent_result["needs_confirm"]:
+            status_box.update(label="⏸️ 等待用户确认大数据量查询", state="running")
+        else:
+            status_box.update(label="✅ 分析完成", state="complete")
+
+    if agent_result["needs_confirm"]:
+        nc = agent_result["needs_confirm"]
+        st.session_state.pending = {
+            "question":       nc["question"],
+            "sql":            nc["sql"],
+            "intent":         nc.get("intent", nc["question"]),
+            "status":         "confirm",
+            "error":          None,
+            "estimated_rows": nc["estimated_rows"],
+        }
+        return
+
+    # 收集本轮 make_chart 生成的 Plotly Figure
+    charts = [item["fig"] for item in st.session_state.get("_agent_charts", [])]
+    st.session_state._agent_charts = []
+
+    # 取本轮最新查询结果，供 DataFrame 内联展示
+    latest_key = st.session_state.get("latest_query_key")
+    latest_df  = None
+    if latest_key and latest_key in st.session_state.get("query_results", {}):
+        latest_df = st.session_state["query_results"][latest_key]["df"]
+
+    # 把 SQL 写入历史记录（取 tool_calls_log 里 query_database 的 SQL）
+    for step in agent_result["tool_calls_log"]:
+        if step["tool_name"] == "query_database":
+            entry = {"question": user_input, "sql": step["args"].get("sql", "")}
+            history_list = st.session_state.sql_history
+            if entry not in history_list:
+                history_list.insert(0, entry)
+                if len(history_list) > 10:
+                    history_list.pop()
+            break  # 只记录第一个 SQL（多 SQL 场景后续版本再扩展）
+
+    st.session_state.messages.append({
+        "role":           "assistant",
+        "content":        agent_result["final_answer"],
+        "question":       user_input,
+        "tool_calls_log": agent_result["tool_calls_log"],
+        "dataframe":      latest_df,
+        "charts":         charts,
+    })
 
 
 # ── 程序入口 ──────────────────────────────────────────────────────────────────
