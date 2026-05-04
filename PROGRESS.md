@@ -1,6 +1,587 @@
 # AI 数据分析 Agent · 开发进度
 
-## 今日完成（2026-05-02）
+## 今日完成（2026-05-04）
+
+### Week 3 · Day 21：归因诊断工具接入 Agent（Day 21 手册任务）
+
+手册对应：`AI数据分析Agent_完整开发手册_v2.md` **第 1690–1724 行**
+
+#### 修改文件
+
+**`src/agent.py`**
+
+- `AGENT_SYSTEM_PROMPT` 的 `【diagnose_metric 使用规则】` 段落扩充两块内容：
+  1. **调用前确认清单**：触发时机明确为"为什么X变了/X下跌的原因"；调工具前须在心里核实三点：指标定义（销售额是否含运费）、对比时期（A期/B期）、下钻维度（最多4个）
+  2. **输出格式 5 条强制要求**：
+     - 总体变化量（绝对值 + 百分比）
+     - Top 3 贡献因素（变化量 + 贡献度%）
+     - 置信度评估（直接引用工具返回值，不得自行修改）
+     - 局限性说明（未建模的外部因素）
+     - 建议下一步动作（具体可执行）
+
+#### 当前状态
+
+归因诊断功能（Day 18-21）已全部完成：
+
+| 阶段 | 内容 |
+|---|---|
+| Day 18（validators + Schema） | `TIME_FILTER_TEMPLATES`、`validate_diagnose_params`、`diagnose_metric` 工具 Schema |
+| Day 19-20（核心实现） | SQL 拼接、贡献度计算、LLM 结论生成、置信度评估，共 6 个函数 |
+| Day 21（接入 Agent） | System Prompt 触发规则 + 确认清单 + 输出格式 5 项要求 |
+
+---
+
+### BugFix：Rule 6 隐式过滤——LLM 自加数量阈值过滤
+
+**现象**：用户问"各品类平均价格、平均评分和订单量三者的关系"，LLM 自行在 SQL 中加了 `WHERE order_count >= 10`（注释写"过滤订单量太少的品类，使气泡图更有意义"），导致第一次查询返回 70 条，后续追问变为 73 条，数据前后不一致。
+
+**根因**：Rule 6 只列举了 `order_status != 'canceled'` 作为反例，未覆盖"以提升图表质量为由"的数量阈值过滤。
+
+**修复（`src/agent.py` + `src/prompts.py`）**：
+
+- `agent.py` Rule 6 新增：严禁以"提升图表质量/数据太少没意义"为由自加数量阈值过滤（`order_count >= N`、`HAVING COUNT(*) > N`），且 SQL 注释里的合理性解释不构成豁免
+- `prompts.py` Rule 6 新增同类反例：`WHERE order_count >= 10`，并附具体注释场景
+
+---
+
+### BugFix：气泡图 KeyError（`AGENT_SYSTEM_PROMPT.format()` 花括号未转义）
+
+**现象**：添加气泡图功能后，Agent 启动即报 `KeyError: '"size_col"'`，发生在 `agent.py` 第 363 行 `AGENT_SYSTEM_PROMPT.format(schema_text=schema_text)`。
+
+**根因**：气泡图示例中的 `{"size_col": "order_count", "label_col": "category"}` 包含花括号，被 Python `.format()` 当作占位符解析。
+
+**修复（`src/agent.py`）**：将示例中的 `{...}` 改为 `{{...}}`（format 转义写法），LLM 看到的内容不变。
+
+---
+
+### Week 3 · Day 22：气泡图（bubble）
+
+手册对应：`AI数据分析Agent_完整开发手册_v2.md` **第 1289–1424 行**
+
+#### 修改文件
+
+**`src/tools.py`**
+
+- `make_chart` 函数签名新增 `bubble_options: dict = None`
+- 绘图 section 4 新增 `elif final_type == "bubble"` 分支：
+  - 从 `bubble_options` 读取 `size_col / label_col / size_max / color_col`
+  - 参数校验：`size_col` 缺失或字段不存在 → 直接返回错误
+  - 数值校验：`size_col` 含非正数 → 自动偏移（不报错）+ 追加 warning
+  - `hover_data`：X/Y 轴显示 2 位小数，size_col 显示千位符
+  - `px.scatter(size=size_col)` 绘制气泡图
+  - `add_vline / add_hline`：中位数参考线（必须显示）
+  - 象限统计 `_bubble_quadrant_counts`：四象限数据点计数，存入 chart dict
+- 布局 section 5：新增 `elif final_type == "bubble"` 分支，对 X、Y 双轴应用 `_apply_tick_format`
+- 存储 section 6：气泡图额外写入 `chart_kind="bubble"` 和 `quadrant_counts`
+- `execute_tool`：透传 `bubble_options=args.get("bubble_options")`
+
+**`src/validators.py`**
+
+- `validate_chart_type` 新增规则 5（气泡图）：
+  - X/Y 轴为非数值列 → 降级为 bar + 警告
+  - 数据量 < 3 → 降级为 table + 警告
+  - 数据量 > 200 → 保留 bubble，只显示建议过滤的提示
+- 原规则 5（y_cols 多系列）顺延为规则 6
+
+**`src/agent.py`**
+
+- `AGENT_SYSTEM_PROMPT` 图表选择规则新增气泡图条目：
+  - 选择条件：三个数值维度 + 大小语义字段 + 数据点 5-100 个
+  - 调用要求：必须填 `bubble_options.size_col`，建议填 `label_col`
+  - 典型触发词："三维分析"/"气泡"/"大小表示"
+  - 附完整参数示例
+
+**`src/app.py`**
+
+- `_render_message()` 新增 `elif chart_kind == "bubble"` 分支：
+  - 渲染 Plotly 气泡图
+  - 渲染象限分布 expander（"📊 象限分布统计"，显示各象限数据点数 + 占比）
+
+#### 测试用例（手册）
+
+```
+"用气泡图分析各品类的平均价格、平均评分和订单量的关系"
+→ X 轴: avg_price，Y 轴: avg_score，气泡大小: order_count
+→ 中位数参考线划分四象限，悬停显示品类名称
+```
+
+---
+
+### Week 3 · Day 21（下）：词云图（wordcloud）
+
+手册对应：`AI数据分析Agent_完整开发手册_v2.md` **第 858–994 行**
+
+#### 新建文件
+
+**`src/chart_utils.py`**
+
+- **`get_font_path()`**：自动检测中文字体，优先级：项目内置 `assets/fonts/SimHei.ttf` → 系统字体（Windows msyh/simhei / Mac STHeiti / Linux wqy）→ None（降级，打印警告）
+- **`render_wordcloud(df, text_col, word_col, freq_col, title, colormap, max_words, language)`**：
+  - 两种输入模式：已分词（word_col+freq_col）或原始文本（text_col）
+  - 中文停用词过滤（60+ 个常用停用词）
+  - 语言自动检测：auto 模式通过 Unicode 范围判断是否含中文
+  - jieba 分词（中文），缺 jieba 时自动降级为标点切分并打印警告
+  - max_words 上限 200，超出自动截断
+  - matplotlib Agg 后端渲染，不弹 GUI 窗口
+  - 输出 PNG bytes（150 dpi），不依赖 Streamlit
+
+**`test_wordcloud.py`**
+
+- `test_word_freq_mode()`：10 个品类 + 订单量的 DataFrame，测试 word_col+freq_col 模式
+- `test_text_col_mode()`：英文评论文本，测试 text_col 模式
+- 两项测试均通过（208 KB + 255 KB PNG）
+
+#### 修改文件
+
+**`src/validators.py`**
+
+- 新增 `validate_wordcloud_input(df, wc_opts)`：
+  - 检查 text_col 或 (word_col + freq_col) 至少提供一组
+  - text_col 列存在性 + 全空检查
+  - freq_col 数值类型检查
+  - 有效行数 < 5 时返回警告（不阻断生成）
+
+**`src/tools.py`**
+
+- 导入 `chart_utils` 和 `validate_wordcloud_input`
+- `TOOLS_SCHEMA make_chart`：
+  - `chart_type` enum 新增 `"wordcloud"`
+  - `x_col` 描述更新（词云不需要）
+  - 新增 `wordcloud_options` 参数（含 text_col/word_col/freq_col/colormap/max_words/language）
+  - `required` 移除 `x_col`（词云和非词云都兼容）
+- `make_chart` 函数签名新增 `wordcloud_options: dict = None`，`x_col` 改为可选
+- 词云图早出分支（在 x_col/y_col 校验之前检测 `chart_type == "wordcloud"`）：
+  - 调 `validate_wordcloud_input` → 调 `chart_utils.render_wordcloud`
+  - 存入 `_agent_charts` 字典：含 `chart_kind="wordcloud"` + `png_bytes`
+- `execute_tool` 透传 `wordcloud_options`
+
+**`src/app.py`**
+
+- `_render_message()` 图表循环改为 `enumerate`（获取索引用于 download_button key 去重）
+- 检测 `chart_kind == "wordcloud"`：`st.image(png_bytes)` + `st.download_button` 下载 PNG
+- `chart_kind` 不存在时回退为 plotly 渲染（向后兼容）
+
+**`src/agent.py`**
+
+- 图表选择规则新增 wordcloud 条目：已聚合数据用 word_col+freq_col，原始文本用 text_col
+
+#### 新增依赖
+
+```
+pip install wordcloud matplotlib
+```
+
+---
+
+### Week 3 · Day 21（上）：图表类型用户需求优先
+
+#### 需求背景
+
+用户希望绘图时自己有最终决定权：明确指定了图表类型则优先使用，LLM 认为不合理时**同时返回两张图**供选择，而非静默降级。
+
+#### 改动设计
+
+| 场景 | 旧行为 | 新行为 |
+|---|---|---|
+| 用户指定合理图表类型 | LLM 自行选择（可能忽略用户意图） | 强制使用用户指定类型 |
+| 用户指定不合理类型（如 pie 画 20 类） | 自动降级为 barh，显示警告 | 返回两张图：**📌 你要求的图表** + **💡 AI 推荐图表** |
+| 用户未指定类型 | LLM 自行选择 | 同旧行为，无变化 |
+
+#### 修改文件
+
+**`src/tools.py`**
+
+- `make_chart` Schema 的 `description` 新增三条图表类型优先级规则说明
+- Schema 新增 `force_chart_type` 参数（boolean）：true 时跳过 `validate_chart_type`，强制使用用户指定类型
+- Schema 新增 `chart_source` 参数（enum: normal/user_requested/ai_recommended）：标记图表来源
+- `make_chart` 函数签名新增 `force_chart_type: bool = False` 和 `chart_source: str = "normal"`
+- Step 2 改为：`force_chart_type=True` 时直接 `final_type=chart_type, warning=None`，跳过校验
+- `_agent_charts` 存储字典新增 `chart_source` 字段
+- `execute_tool` 透传两个新参数
+
+**`src/agent.py`**
+
+- `AGENT_SYSTEM_PROMPT` 在图表选择规则前新增【图表类型用户需求优先规则】章节：
+  - 情况 A（用户要求合理）：force_chart_type=true + chart_source="user_requested"，只调一次
+  - 情况 B（用户要求不合理）：先调一次 force=true（user_requested），再调一次推荐类型（ai_recommended），文字说明两图的区别
+  - 情况 C（用户未指定）：正常流程，chart_source="normal"
+
+**`src/app.py`**
+
+- `_render_message()` 图表渲染循环新增 `chart_source` 读取
+- `user_requested` 时在图表上方显示 `📌 你要求的图表`
+- `ai_recommended` 时显示 `💡 AI 推荐图表（数据更适合此类型）`
+- `normal` 时不显示标签（兼容旧行为）
+
+---
+
+## 今日完成（2026-05-03 晚）
+
+### Week 3 · Day 18-20：归因诊断工具 `diagnose_metric`
+
+手册对应：`AI数据分析Agent_完整开发手册_v2.md` **第 835–994 行**
+
+#### 新增功能
+
+**`diagnose_metric` 工具**：将"为什么 X 指标变了"这一最高频分析需求工程化。输入两个时间段和下钻维度，自动完成 SQL 拼接、贡献度计算、置信度评估，并调用 LLM 生成中文归因结论。
+
+---
+
+#### Day 18：时间模板层 + 工具 Schema
+
+**`src/prompts.py`**
+
+- 新增常量 `TIME_FILTER_TEMPLATES`（5 种模板：month_range / quarter / year / last_n_days / custom）
+- 每条含 description / template / example，供 LLM few-shot 参考；diagnose_metric Schema 的 description 中内联了完整示例
+
+**`src/validators.py`**
+
+- 新增 `import re`
+- 新增常量 `_DANGEROUS_KEYWORDS`（INSERT/UPDATE/DELETE/DROP/CREATE/ALTER/TRUNCATE/EXEC/EXECUTE）
+- 新增 `validate_diagnose_params(base_sql, period_a, period_b, drill_dimensions) -> tuple[bool, str]`：
+  - 检查 base_sql / filter_sql 不含危险关键字
+  - 检查 base_sql 含 SELECT 和 FROM
+  - 检查 period_a/b 的 filter_sql / label 非空
+  - 检查 drill_dimensions 非空且各项有 dimension_name / dimension_col
+
+**`src/tools.py`**（Schema 部分）
+
+- 新增 imports：`re`、`OpenAI`、`DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / MODEL_NAME`、`validate_diagnose_params`
+- `TOOLS_SCHEMA` 追加第 4 个工具 `diagnose_metric`：
+  - 必填参数：metric_name / base_sql / date_column / period_a / period_b / drill_dimensions
+  - 可选参数：decomposition_formula（指标分解公式，如"销售额 = 订单数 × 客单价"）
+  - description 内联时间过滤 few-shot 示例
+
+---
+
+#### Day 19-20：核心实现
+
+**`src/tools.py`**（函数实现部分）
+
+| 函数 | 作用 |
+|---|---|
+| `_split_base_sql(base_sql)` | 正则拆分 SELECT 聚合表达式 + FROM 子句 |
+| `_run_sql(sql, ds)` | 执行 SQL，返回 (首数值列值, DataFrame) |
+| `_run_dim_sql(sql, ds)` | 容错版维度 SQL 执行，失败返回空 DataFrame |
+| `_call_llm_for_conclusion(...)` | 调 DeepSeek 生成 3-5 句中文归因结论 |
+| `_assess_confidence(change_pct, top_contribution_pct, period_a_value)` | 规则评估置信度（高/中/低）+ 局限性列表 |
+| `diagnose_metric(...)` | 主函数，6 步完成完整归因分析 |
+
+`diagnose_metric` 执行逻辑（6 步）：
+
+1. **参数校验**：调 `validate_diagnose_params`，失败立即返回错误，不执行 SQL
+2. **总体变化**：拼接 `{base_sql} WHERE {filter_sql}` 查两期指标值，计算绝对/相对变化
+3. **维度下钻**：对每个 drill_dimension：
+   - 构造带 GROUP BY 的 SQL（支持 extra_join），自动追加品类 NULL 过滤
+   - 分别查 A/B 期数据，outer merge，计算每个维度值的 `contribution_pct`
+   - `contribution_pct = (val_b - val_a) / |total_change| × 100`
+   - 按贡献度绝对值降序排列，取 Top 10
+4. **汇总 Top 贡献因素**：跨所有维度合并，取 Top 5，按贡献度绝对值排序
+5. **LLM 结论**：把总体变化 + Top 5 贡献因素传给 DeepSeek，生成中文归因段落
+6. **存储 & 返回**：结构化结果存入 `session_state['_diagnose_results']`，返回格式化文本摘要
+
+置信度评估规则（纯代码，不用 LLM 自评）：
+- **高**：总变化 > 10% 且 Top 贡献因素占比 > 40%
+- **中**：总变化 5-10%，或 Top 贡献 20-40%
+- **低**：总变化 < 5%（可能是正常波动）或 Top 贡献 < 20%
+
+**`src/agent.py`**
+
+- system prompt 工具列表新增 `diagnose_metric` 条目（含适用场景说明）
+- 新增【diagnose_metric 使用规则】章节：base_sql 格式、filter_sql 标准写法、品类维度 extra_join 固定写法
+
+---
+
+#### 修改文件汇总
+
+| 文件 | 变更内容 |
+|---|---|
+| `src/prompts.py` | 新增 `TIME_FILTER_TEMPLATES` 常量（5 种时间过滤模板） |
+| `src/validators.py` | 新增 `validate_diagnose_params()`（SQL 安全检查 + 参数完整性校验） |
+| `src/tools.py` | 新增 imports；TOOLS_SCHEMA 追加 `diagnose_metric`；新增 5 个私有辅助函数 + `diagnose_metric()` 主函数；`execute_tool()` 加入 `diagnose_metric` 路由 |
+| `src/agent.py` | system prompt 新增工具 4 说明 + 【diagnose_metric 使用规则】章节 |
+
+---
+
+## 当前停在
+
+**Week 3 · Day 22 完成（2026-05-04）**
+
+当前 Agent 具备的能力：
+- **防幻觉**：`query_database` ≤100 行全量传给 LLM
+- **SQL 防护**：12 条规则（Fan-out、NULL 品类、同比/环比、跨年边界、禁止自加数量阈值过滤等）
+- **多步规划**：先输出分析计划，逐步调用工具
+- **多轮记忆**：`_trim_messages` 确保不超 token 限制
+- **智能图表**：11 种图表类型（新增 bubble）+ 自动校验降级 + insight + 原始数据 expander
+- **多系列图表**：bar/barh/line 支持 y_cols（宽格式）和 color_col（长格式）
+- **词云图**：wordcloud，支持已聚合（word_col+freq_col）和原始文本（text_col）两种模式
+- **气泡图**：bubble，中位数参考线 + 四象限统计 + 双轴 k/M/G 格式化
+- **归因诊断**：`diagnose_metric` 全链路（Day 18-21 已完成）：
+  - SQL 拼接 + 贡献度计算 + 置信度评估 + LLM 结论生成
+  - System Prompt 接入：触发规则 + 调用前确认清单 + 输出格式 5 项要求
+
+下次工作建议：
+1. **app.py 渲染 diagnose_metric 结果**：在 `_render_message()` 中解析 `_diagnose_results`，用 Plotly 瀑布图可视化贡献度
+2. **图表交互优化**：下钻、筛选、导出 PNG/CSV
+3. **多数据源支持**：用户上传 CSV/Excel 后可直接查询
+
+---
+
+## 今日完成（2026-05-03 下午）
+
+### Week 3 · Day 18：图表系统 BugFix + 多系列图表能力
+
+本次工作以实际提问测试 Agent 图表输出质量为驱动，修复 8 个图表 Bug，并新增多系列图表能力。
+
+---
+
+#### BugFix 1：barh 横纵轴对调（轴标题与数据单位相反）
+
+**现象**：barh 图 Y 轴标题显示"州"但值是数字，X 轴标题显示"订单量"但值是州名。
+
+**根因**：`make_chart` 工具描述中 `y_col` 写的是"主指标"，LLM 把度量列给了 y_col；而 Plotly `px.bar(orientation='h')` 约定 x=度量、y=分类，导致轴对调。
+
+**修复（`src/tools.py`）**：
+- 工具描述明确：**barh 时 x_col 填度量列、y_col 填分类列**
+- barh 绘图路径加防御逻辑：若检测到 x_col 是字符串列、y_col 是数值列，**自动对调**
+
+---
+
+#### BugFix 2：图表数值无 k/M/G 单位，小数位不受控
+
+**现象**：轴刻度显示原始数值（如 41746），无单位缩写，部分浮点数小数位过多。
+
+**修复（`src/tools.py`）**：
+- 添加常量 `_TICK_FMT_STOPS`（Plotly `tickformatstops`）：步长 < 1k 保留 2 位小数、1k-1M 用 k、1M-1B 用 M、≥1B 用 G
+- 添加 `_apply_tick_format(fig, axes)` 工具函数，统一应用到所有图表数值轴
+- 移除旧的「万单位缩放」逻辑（数据不再 ÷10000），改为纯显示层格式化
+
+---
+
+#### BugFix 3：combo 双轴图右轴标题为英文列名
+
+**现象**：右侧 Y 轴标题显示 `total_amount`（原始列名），应显示中文。
+
+**修复（`src/tools.py`）**：
+- Schema 新增 `y_axis_label_2` 参数（中文右轴标题，仅 combo 使用）
+- `make_chart` 函数签名和 `execute_tool` 同步更新
+- combo 绘图代码改为 `y_axis_label_2 or y_col_2`
+
+---
+
+#### BugFix 4：同比/环比计算混用（环比 SQL 实为同比逻辑）
+
+**现象**：用户问"环比"，Agent 生成 `LAG(val, 12)` 跨年比较，实为同比。
+
+**修复（`src/agent.py` SQL 规则 11）**：
+- 明确定义：**环比 = LAG(val, 1)（紧邻上一期）**；**同比 = LAG(val, 12/4)（上一年同期）**
+- 严禁把环比写成跨年 LAG
+
+---
+
+#### BugFix 5：heatmap 颜色列使用第一个非 x/y 列，而非目标指标列
+
+**现象**：要求热力图展示环比率，但颜色却按 `total_amount` 渲染（第一个非 x/y 列），因为代码硬写了 `other_cols[0]`。
+
+**修复（`src/tools.py`）**：
+- heatmap 绘图路径改为**优先使用 `color_col`**，未提供时才 fallback 到 `other_cols[0]`
+- `color_col` schema 描述明确：**heatmap 必填，指定哪列决定格子颜色**
+- `agent.py` 图表规则补充 **heatmap 专项规则**：必须设置 `color_col`
+
+---
+
+#### BugFix 6：heatmap 含负值但使用蓝色单色板
+
+**修复（`src/tools.py`）**：
+- 自动检测 z 列是否含负值，含负值改用 `RdYlGn`（红绿双色，0 为黄色中间）
+- 格子内显示数值（`text_auto=".1f"`）
+
+---
+
+#### BugFix 7：heatmap 极端异常值劫持色阶（全图两色）
+
+**现象**：PR 州 1 月环比 +50,235%，色阶上限被拉到 50k，其余所有格子全红。
+
+**修复（`src/tools.py`）**：
+- 使用 **5th/95th 百分位截断**设定 `zmin/zmax`
+- 含负值时：取 q5/q95 绝对值较大者作边界，色阶从 `-bound` 到 `+bound`（0 居中）
+- 大多数格子充分展示颜色差异，极端值仍显示为极端色
+
+---
+
+#### BugFix 8：环比计算 1 月显示 None（跨年边界数据缺失）
+
+**现象**：计算 2017 年月度环比，1 月 `prev_month_amount` 为 None，因为 SQL `WHERE year=2017` 导致 LAG(1) 在月份=1 时找不到上一期。
+
+**修复（`src/agent.py` SQL 规则 12）**：
+- 新增「**跨年边界**」规则：环比/同比计算必须在 CTE 里多拉一个前置期（2016-12），计算完 LAG 后外层再 WHERE 过滤回目标年份
+- 附完整 SQL 示例供 LLM 参照
+
+---
+
+#### 新功能：多系列图表（bar / barh / line）
+
+**背景**：原图表只支持单列 `y_col`，无法展示"各季度各州订单对比"等多系列需求。
+
+**交付内容（`src/tools.py` + `src/validators.py` + `src/agent.py`）**：
+
+| 改动点 | 内容 |
+|---|---|
+| Schema 新增 `y_cols` 参数 | 数组类型，bar/barh/line 宽格式多系列专用；`y_col` 从 required 移除 |
+| `y_col` 描述更新 | 明确"单系列时使用，多系列改用 y_cols" |
+| 函数签名 | `make_chart` 加 `y_cols: list = None`，`execute_tool` 同步传参 |
+| 多系列分发逻辑 | `is_multi = bool(y_cols)`，bar/barh/line 各加 `if is_multi` 分支 |
+| 3 个私有函数 | `_make_bar_multi`（分组柱）、`_make_barh_multi`（横向分组条）、`_make_line_multi`（多线折线） |
+| 字段校验 | y_cols 中不存在的列 / 非数值列均返回明确错误 |
+| `validators.py` 规则 5 | >15 系列警告；pie/donut/scatter 传 y_cols → 自动降级为 bar |
+| `agent.py` 多系列规则 | 宽格式（多数值列）用 y_cols；长格式（分组字段+数值列）用 color_col；含判断示例 |
+
+**支持的使用模式**：
+- 宽格式：`x_col="月份", y_cols=["Q1","Q2","Q3","Q4"]`（SQL 用 PIVOT/CASE WHEN 生成宽表）
+- 长格式：`x_col="月份", y_col="销量", color_col="品类"`（GROUP BY 两维度的长表）
+
+---
+
+#### 修改文件汇总
+
+| 文件 | 变更内容 |
+|---|---|
+| `src/tools.py` | barh 自动纠偏；k/M/G tick 格式化；`y_axis_label_2`；heatmap color_col 优先级 + 百分位色阶 + RdYlGn；`y_cols` 多系列支持；3 个多系列私有函数 |
+| `src/validators.py` | 多系列规则 5（系列数、pie/scatter 降级） |
+| `src/agent.py` | SQL 规则 11（同比/环比定义）；规则 12（跨年边界）；图表规则补充 heatmap 专项 + 多系列规则 |
+
+---
+
+## 当前停在
+
+**Week 3 · Day 18 完成**
+
+当前图表系统具备的能力：
+- **10 种图表类型**：bar / barh / line / area / pie / donut / scatter / heatmap / combo / table
+- **多系列图表**：bar / barh / line 支持 `y_cols`（宽格式）和 `color_col`（长格式）两种模式
+- **轴格式化**：k/M/G 自动单位，最多 2 位小数，barh / combo 双轴均覆盖
+- **barh 纠偏**：LLM 传反列时自动对调，不报错
+- **heatmap**：正确指标列着色 + 正负双色 + 百分位鲁棒色阶 + 格子内数值
+- **SQL 防护**：12 条规则，含同比/环比区分、跨年边界、NULL 品类、Fan-out 等
+
+下次工作建议（根据手册优先级）：
+1. **图表交互优化**：下钻、筛选、导出 PNG/CSV
+2. **多数据源支持**：用户自定义上传 CSV/Excel 文件后可直接查询
+3. **Agent 能力升级**：支持"帮我写分析报告"等长文本输出
+
+---
+
+## 今日完成（2026-05-03 上午）
+
+### Week 3 · Day 15-17：智能图表系统
+
+手册对应：`AI数据分析Agent_完整开发手册_v2.md` **第 651–811 行**
+
+#### 新建文件
+
+**`src/validators.py`**
+
+- **`validate_chart_type(chart_type, df, x_col, y_col) -> tuple[str, str | None]`**：
+  - 规则1：pie/donut 类别数 > 5 → 自动切换 barh + 警告
+  - 规则2：line 的 x_col 无法解析为时间格式 → 切换 bar + 警告
+  - 规则3：scatter 的 x 或 y 列不是数值型 → 切换 bar + 警告
+  - 规则4：数据只有 1 行 → 不切换，只警告
+
+#### 修改文件
+
+**`src/tools.py`**
+
+- **新增常量 `COLOR_PALETTE`**：10色商业色板（Seaborn deep 系列）
+- **`TOOLS_SCHEMA` 中 make_chart 完整重写**：
+  - chart_type enum 从 4 种扩展到 10 种（新增 barh / donut / heatmap / area / combo / table）
+  - 新增参数：`y_col_2`（combo 第二轴）、`color_col`（多系列着色）、`x_axis_label`、`y_axis_label`、`format_options`（sort_by/limit/auto_format_large）、`insight`（图表解读，必填）
+  - required 字段增加：chart_type、x_col、y_col、title、x_axis_label、y_axis_label、insight
+- **`_apply_format_options()` 辅助函数**：处理排序/截断/大数值万元化
+- **`make_chart()` 全面重写**：
+  - 支持所有 10 种图表类型（bar/barh/line/area/pie/donut/scatter/heatmap/combo/table）
+  - combo 双轴图用 `make_subplots(secondary_y=True)` 实现
+  - heatmap 自动 pivot 为矩阵或降级为密度热力图
+  - table 用 `go.Table` 渲染，含斑马纹行色
+  - 存入 `_agent_charts` 的结构升级为 `{fig, title, warning, insight, df}`
+- **`execute_tool()`**：透传新增参数（y_col_2/color_col/format_options/insight 等）
+
+**`src/app.py`**
+
+- **`_run_and_store_agent()`**：charts 提取从 `[item["fig"] for item in ...]` 改为 `list(...)` 保留完整字典
+- **`_render_message()` 图表渲染升级**：
+  - 判断 chart 是 dict（新格式）还是 Figure 对象（旧格式，向后兼容）
+  - 新格式依次渲染：`st.plotly_chart` → `st.warning`（若有降级警告）→ `st.info`（insight 解读）→ `st.expander("查看原始数据")`
+
+**`src/agent.py`**
+
+- **`AGENT_SYSTEM_PROMPT` 新增【图表选择规则】**：
+  禁止 3D 饼图、类别>5用 barh、时间序列用 line、双量级用 combo、不确定用 bar/table、必须填 result_key
+
+#### 测试场景（手册要求）
+
+| 场景 | 预期行为 |
+|---|---|
+| LLM 尝试 pie 画 20 个品类 | 自动降级为 barh + 显示警告 |
+| LLM 用 line 画分类字段（非时间） | 自动降级为 bar + 警告 |
+| 正常 bar 图 | 正常显示，无警告，含 insight + 原始数据 expander |
+| combo 双轴（订单量+转化率） | 左轴柱状 + 右轴折线，两轴颜色对应 |
+
+---
+
+
+
+### Week 2 · Day 14：多轮记忆 + 上下文管理
+
+手册对应：`AI数据分析Agent_完整开发手册_v2.md` **第 596–623 行**
+
+#### 修改文件
+
+**`src/agent.py`**
+
+- **新增常量** `MAX_CONTEXT_CHARS = 50_000`、`KEEP_ROUNDS = 6`
+- **新增 `_trim_messages(messages)` 函数**：
+  - 计算 messages 总字符数，超过 50000 时触发截断
+  - 始终保留：system message + 最新 6 轮完整对话
+  - 对旧轮次：保留 user 消息 + assistant 最终文字回答，删除 tool 消息和 tool_calls 细节（占空间最多）
+  - 兼容 messages 中混有 OpenAI `ChatCompletionMessage` 对象（非 dict）的情况
+- **在 Agent 主循环每次迭代开头调用** `messages = _trim_messages(messages)`，确保每次 LLM 调用前都不超限
+- **`AGENT_SYSTEM_PROMPT` 新增【上下文记忆】章节**，4 条规则：
+  1. 理解代词指向（"那"指上一轮主题，直接延续）
+  2. 沿用用户自定义术语（如"活跃用户=最近30天有下单"）
+  3. 避免重复查询（历史已有的结论直接引用）
+  4. 推进分析深度（已看过的维度→推荐下钻）
+
+**`src/app.py`**
+
+- **Sidebar 顶部新增「🗑️ 清空对话」按钮**：
+  - 清空 `st.session_state.messages`（重置为初始欢迎语）
+  - 清空 `query_results`、`latest_query_key`、`_agent_charts`、`pending`
+  - 调用 `st.rerun()` 立即刷新页面
+
+#### 交付标准对应（手册测试场景）
+
+| 对话轮次 | 预期 Agent 行为 |
+|---|---|
+| 对话 1: `"查一下 2017 年总销售额"` | 正常查询，返回结论 |
+| 对话 2: `"那分到各个州看呢？"` | 理解"那"→ 2017 年销售额，按州分组查询，不重新发问 |
+| 对话 3: `"Top 5 的州具体是哪些？"` | 延续上轮结果，直接筛选 Top 5，三轮上下文连贯 |
+
+---
+
+## 历史阶段总结（截至 2026-05-03 上午，Week 3 Day 15-17 完成）
+
+当前 Agent 具备的能力总结：
+- **防幻觉**：`query_database` 返回 ≤100 行全量数据，禁止 LLM 在结果外补充
+- **SQL 防护**：10 条规则（Fan-out、NULL 品类、隐式过滤、自造标签等）
+- **多步规划**：先输出分析计划，逐步调用工具，每步说明发现
+- **多轮记忆**：对话历史传给 LLM，`_trim_messages` 确保不超 token 限制
+- **智能图表**：10 种图表类型 + 自动校验降级 + insight 解读 + 原始数据 expander
+
+手册进度：`AI数据分析Agent_完整开发手册_v2.md` 第 811 行（Day 17 结束）。
+
+---
+
+## 历史记录（2026-05-02）
 
 ### 数据一致性深度排查 · Prompt 防护体系完善（无手册对应，超出计划的自主 QA）
 

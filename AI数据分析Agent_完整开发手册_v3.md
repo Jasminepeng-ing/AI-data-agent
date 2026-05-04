@@ -1,4 +1,4 @@
-# AI 数据分析 Agent · 完整开发手册 v2
+# AI 数据分析 Agent · 完整开发手册 v3
 
 > 适用对象:有 SQL + Pandas 基础,使用 Claude Code 辅助开发的数据分析师
 > LLM 选型:DeepSeek-V3 (deepseek-chat)
@@ -6,17 +6,22 @@
 
 ---
 
-## 修订说明(v1 → v2)
+## 修订说明(v1 → v2 → v3)
 
-> 本次修订修复了 v1 中 5 个结构性问题,对应章节已标注 `[修订]`。
+> v2 修订修复了 5 个结构性问题,对应章节已标注 `[v2 修订]`。
+> v3 在 v2 基础上新增**词云图、漏斗图、气泡图**三种图表类型,对应章节已标注 `[v3 新增]`。
 
-| # | 问题 | 影响 | 修复位置 |
+| # | 问题 / 新增 | 影响 | 位置 |
 |---|---|---|---|
-| 1 | `last_result` 跨轮污染导致图表画错数据 | 🔴 严重 Bug | 3.2 节工具设计 |
+| 1 | `last_result` 跨轮污染导致图表画错数据 | 🔴 严重 Bug | 3.2 节 |
 | 2 | SQL 确认按钮打断 Agent 多步流 | 🟠 体验矛盾 | 2.4 节 + 3.2 节 |
 | 3 | 归因工具复杂度低估,时间和实现方案不足 | 🟠 进度风险 | 4.2 节 |
 | 4 | 图表类型无硬校验,完全依赖 LLM 自律 | 🟡 质量隐患 | 4.1 节 |
 | 5 | 报告只有 Markdown,无法直接发给领导/同事 | 🟡 实用性缺口 | 4.3 节 |
+| 6 | **[v3]** 新增词云图(wordcloud)实现与校验 | 🟢 能力扩展 | 4.1 节 |
+| 7 | **[v3]** 新增漏斗图(funnel)实现与校验 | 🟢 能力扩展 | 4.1 节 |
+| 8 | **[v3]** 新增气泡图(bubble)实现与校验 | 🟢 能力扩展 | 4.1 节 |
+| 9 | **[v3]** Day 22 报告新增 PDF 导出(含图表嵌入) | 🟢 能力扩展 | 4.3 节 |
 
 ---
 
@@ -39,15 +44,43 @@
 | Agent 编排 | 原生 Function Calling | 不用 LangChain |
 | 数据存储与查询 | DuckDB | SQL 统一访问多源 |
 | 数据处理 | Pandas | 辅助 |
-| 可视化 | Plotly | 交互式图表 |
-| 报告导出 | python-docx | Word 格式导出(v2 新增) |
+| 可视化(结构化) | Plotly | 交互式图表(漏斗图、气泡图等) |
+| 可视化(文本) | wordcloud + matplotlib | 词云图渲染(v3 新增) |
+| 报告导出(Word) | python-docx | Word 格式导出(v2 新增) |
+| 报告导出(PDF) | weasyprint + markdown + kaleido | PDF 生成:MD→HTML→PDF + 图表嵌入(v3 新增) |
 | 部署 | Streamlit Community Cloud | 免费 |
 
 ### 1.3 环境准备
 
 ```bash
+# 核心依赖(Week 1-4,与 v2 相同)
 pip install streamlit duckdb pandas plotly openai python-dotenv openpyxl python-docx
+
+# v3 新增:词云图依赖
+pip install wordcloud matplotlib
+# 如果你的数据包含中文文本,还需要:
+pip install jieba
+
+# v3 新增:PDF 报告依赖
+pip install weasyprint markdown kaleido
 ```
+
+> **关于 PDF 依赖库的说明:**
+>
+> - `markdown`:把 Markdown 文本转换为 HTML 字符串
+> - `weasyprint`:把 HTML + CSS 渲染成 PDF(支持中文、表格、图片嵌入)
+> - `kaleido`:Plotly 官方的图表静态导出引擎,负责把 Plotly 图表转成 PNG 字节流再嵌入 PDF
+>
+> **⚠️ Windows 安装 weasyprint 注意事项:**
+> weasyprint 在 Windows 上依赖 GTK 运行时,安装比 Linux/Mac 复杂。
+> 推荐三种解决方式(任选其一):
+> 1. 用 **WSL2**(Windows Subsystem for Linux),在 Linux 环境下开发(最省事)
+> 2. 按 [weasyprint 官方 Windows 文档](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#windows) 安装 GTK
+> 3. 用 **`fpdf2`** 作为替代方案(不依赖 GTK,但不支持从 HTML 渲染,格式较简单):
+>    ```bash
+>    pip install fpdf2
+>    ```
+>    fpdf2 替代方案的实现会在附录 D 中单独说明。
 
 `.env` 文件:
 ```
@@ -66,6 +99,9 @@ ai-data-agent/
 ├── data/
 │   ├── olist.db
 │   └── raw/
+├── assets/
+│   └── fonts/               # [v3 新增] 中文字体文件(词云用)
+│       └── SimHei.ttf       # 放这里即可,代码自动检测
 ├── src/
 │   ├── app.py               # Streamlit 主程序
 │   ├── agent.py             # Agent 核心:LLM 调用 + 工具循环
@@ -73,6 +109,8 @@ ai-data-agent/
 │   ├── data_source.py       # 数据源抽象层
 │   ├── prompts.py           # System Prompt 模板
 │   ├── validators.py        # [v2 新增] 图表校验 + 输出质量规则
+│   ├── chart_utils.py       # [v3 新增] 词云图渲染工具函数
+│   ├── report_builder.py    # [v3 新增] Word + PDF 报告构建模块
 │   └── config.py
 ├── scripts/
 │   └── init_db.py
@@ -243,12 +281,9 @@ response = client.chat.completions.create(
 sql = response.choices[0].message.content
 
 【交付方式】
-- 每写完/修改完先解释这个文件解决了什么问题、关键设计选择和原因
 - 写完后告诉我: 你的 Prompt 工程做了哪些考虑?
 - 为什么 temperature 设 0.1 而不是 0.7?
 - 如果用户问的问题需要 JOIN 多张表,你怎么让 LLM 知道?
-
-写完/修改一个文件后停一下,我跑通了再让你写下一个。
 ```
 
 **✅ Week 1 Day 5-6 完成标志:**
@@ -588,7 +623,7 @@ Step 5: 输出结论
 测试通过后再优化 UI。
 ```
 
-### 3.4 :多轮记忆 + 上下文管理
+### 3.4 Day 14:多轮记忆 + 上下文管理
 
 **📋 Prompt 模板:**
 
@@ -634,7 +669,7 @@ Step 5: 输出结论
 
 ## 四、Week 3 · 智能图表 + 归因诊断 + 主动洞察
 
-### 4.1 Day 15-17:智能图表系统 [修订]
+### 4.1 Day 15-17:智能图表系统 [v2 修订 + v3 新增]
 
 > ⚠️ **v2 修订说明(对应问题 4)**
 >
@@ -644,6 +679,15 @@ Step 5: 输出结论
 > **修复方案:** 新增 `src/validators.py`,把常识性规则用代码硬编码,
 > LLM 决策的结果必须经过校验层才能执行。这层校验不是"推翻 LLM",
 > 而是"纠正 LLM 的低级失误"。
+
+> 🟢 **v3 新增说明**
+>
+> 在 v2 的 10 种图表基础上新增 3 种:
+> - **词云图(wordcloud)**: 文本频率可视化,需要 `wordcloud + matplotlib` 库
+> - **漏斗图(funnel)**: 流程转化率分析,Plotly 原生支持
+> - **气泡图(bubble)**: 三维变量同时展示,Plotly 原生支持
+>
+> 三种图表均有对应的校验规则和完整的 Prompt 模板。
 
 **📋 Prompt 模板:**
 
@@ -681,6 +725,29 @@ def validate_chart_type(chart_type: str, df: pd.DataFrame,
       warning = None
       if len(df) == 1:
           warning = "数据只有 1 行,图表意义有限,建议使用表格"
+
+    # [v3 新增] 规则 5 - 漏斗图阶段数检查:
+      if chart_type == "funnel":
+          if len(df) < 2:
+              return "bar", "漏斗图至少需要 2 个阶段,已自动切换为柱状图"
+          if len(df) > 10:
+              return "barh", f"漏斗图阶段数({len(df)})过多(建议≤10),已自动切换为横向条形图"
+    
+    # [v3 新增] 规则 6 - 气泡图三列数值检查:
+      if chart_type == "bubble":
+          # x_col 和 y_col 必须是数值
+          if not pd.api.types.is_numeric_dtype(df[x_col]):
+              return "scatter", "气泡图 X 轴必须是数值字段,已降级为散点图"
+          if not pd.api.types.is_numeric_dtype(df[y_col]):
+              return "scatter", "气泡图 Y 轴必须是数值字段,已降级为散点图"
+          # size_col 由调用方在 bubble_options 里校验
+    
+    # [v3 新增] 规则 7 - 词云图字段检查(在 make_chart 调用前由 chart_utils 校验):
+      if chart_type == "wordcloud":
+          # 词云的校验在 chart_utils.validate_wordcloud_input() 中进行
+          # 这里只做基本检查:数据不能为空
+          if len(df) == 0:
+              return "table", "数据为空,无法生成词云"
       
     return chart_type, warning
     """
@@ -705,8 +772,9 @@ def validate_chart_type(chart_type: str, df: pd.DataFrame,
                 "chart_type": {
                     "type": "string",
                     "enum": ["line","bar","barh","pie","donut","scatter",
-                             "heatmap","area","combo","table"],
-                    "description": "图表类型。选择规则:\n- line: 时间序列趋势(X轴必须是时间)\n- bar: 分类对比(类别≤8个)\n- barh: 横向条形图(类别名长 或 >8个)\n- pie/donut: 构成占比(类别≤5个,总和有意义)\n- scatter: 两个连续变量相关性(X和Y都必须是数值)\n- heatmap: 二维交叉分析\n- area: 累积量或占比变化\n- combo: 双轴图(柱+线,不同单位)\n- table: 精确数值查阅\n注意: 代码层会对不合适的类型自动降级,但请尽量选对。"
+                             "heatmap","area","combo","table",
+                             "wordcloud","funnel","bubble"],
+                    "description": "图表类型。选择规则:\n- line: 时间序列趋势(X轴必须是时间)\n- bar: 分类对比(类别≤8个)\n- barh: 横向条形图(类别名长 或 >8个)\n- pie/donut: 构成占比(类别≤5个,总和有意义)\n- scatter: 两个连续变量相关性(X和Y都必须是数值)\n- heatmap: 二维交叉分析\n- area: 累积量或占比变化\n- combo: 双轴图(柱+线,不同单位)\n- table: 精确数值查阅\n- wordcloud: 文本词频可视化(需要文本字段或词频统计)\n- funnel: 漏斗图,展示流程转化(各阶段数值必须递减)\n- bubble: 气泡图,同时展示三个数值维度(X/Y/气泡大小)\n注意: 代码层会对不合适的类型自动降级,但请尽量选对。"
                 },
                 "x_col": {
                     "type": "string",
@@ -761,6 +829,89 @@ def validate_chart_type(chart_type: str, df: pd.DataFrame,
                 "insight": {
                     "type": "string",
                     "description": "图表解读(2-3句中文),必须基于实际数据。包含:1.最显著趋势(量化) 2.第二个发现 3.业务含义或异常"
+                },
+                "wordcloud_options": {
+                    "type": "object",
+                    "description": "[v3 新增] 词云图专用参数,仅当 chart_type='wordcloud' 时填写",
+                    "properties": {
+                        "text_col": {
+                            "type": "string",
+                            "description": "原始文本字段名(如 review_comment_message)。与 freq_col 二选一填写。"
+                        },
+                        "word_col": {
+                            "type": "string",
+                            "description": "词语字段名(已分词时填写,如 'keyword')。与 text_col 二选一。"
+                        },
+                        "freq_col": {
+                            "type": "string",
+                            "description": "词频字段名(已有频次统计时填写,如 'count')。与 text_col 二选一。"
+                        },
+                        "colormap": {
+                            "type": "string",
+                            "enum": ["viridis","plasma","RdYlBu_r","Reds","Blues","Greens","Set2"],
+                            "description": "颜色方案。负面情绪用 Reds,正面用 Greens,中性用 viridis",
+                            "default": "viridis"
+                        },
+                        "max_words": {
+                            "type": "integer",
+                            "description": "最多显示的词数,默认 80",
+                            "default": 80
+                        },
+                        "language": {
+                            "type": "string",
+                            "enum": ["zh","en","pt","auto"],
+                            "description": "文本语言。zh=中文(使用jieba分词),pt=葡萄牙语,auto=自动检测",
+                            "default": "auto"
+                        }
+                    }
+                },
+                "funnel_options": {
+                    "type": "object",
+                    "description": "[v3 新增] 漏斗图专用参数,仅当 chart_type='funnel' 时填写",
+                    "properties": {
+                        "stage_col": {
+                            "type": "string",
+                            "description": "阶段名称字段(如 'order_status' / '渠道步骤'),即漏斗的各层标签"
+                        },
+                        "value_col": {
+                            "type": "string",
+                            "description": "各阶段对应的数值字段(如 'count'),数值应从大到小排列"
+                        },
+                        "show_pct": {
+                            "type": "boolean",
+                            "description": "是否在每层显示转化率百分比,默认 true",
+                            "default": True
+                        },
+                        "orientation": {
+                            "type": "string",
+                            "enum": ["vertical","horizontal"],
+                            "description": "漏斗方向。vertical=竖向(常见),horizontal=横向(阶段名较长时用)",
+                            "default": "vertical"
+                        }
+                    }
+                },
+                "bubble_options": {
+                    "type": "object",
+                    "description": "[v3 新增] 气泡图专用参数,仅当 chart_type='bubble' 时填写",
+                    "properties": {
+                        "size_col": {
+                            "type": "string",
+                            "description": "控制气泡大小的字段(必须是数值,如 'order_count' / 'gmv')"
+                        },
+                        "label_col": {
+                            "type": "string",
+                            "description": "气泡标签字段(悬停时显示,如 'product_category')"
+                        },
+                        "size_max": {
+                            "type": "integer",
+                            "description": "最大气泡的像素尺寸,默认 60",
+                            "default": 60
+                        },
+                        "color_col": {
+                            "type": "string",
+                            "description": "气泡颜色分类字段(可选),用于区分不同组别"
+                        }
+                    }
                 }
             },
             "required": ["chart_type","x_col","y_col","title",
@@ -811,6 +962,7 @@ combo 双轴图实现要点:
 4. 边写边测试,每加一种图表类型就测一次
 ```
 
+---
 
 ### 4.1.1 [v3 新增] 词云图(wordcloud)实现详解
 
@@ -1504,7 +1656,6 @@ Step 2: make_chart
 调用任何图表时都必须填 result_key,明确指定数据来源。
 ```
 
-
 ### 4.2 Day 18-21:归因诊断工具 [修订]
 
 > ⚠️ **v2 修订说明(对应问题 3)**
@@ -1724,31 +1875,43 @@ Day 19-20: diagnose_metric 核心实现(含 SQL 校验、贡献度计算)
 Day 21: 接入 Agent + System Prompt 更新 + 完整测试
 ```
 
-### 4.3 Day 22:主动洞察 + 报告生成(含 Word + PDF 导出) [修订]
+### 4.3 Day 22:主动洞察 + 报告生成(Word + PDF 导出) [v2 修订 + v3 新增]
 
 > ⚠️ **v2 修订说明(对应问题 5)**
 >
 > v1 的报告只能生成 Markdown,在 Streamlit 里看很好,
-> 但发给领导/同事时没人用 Markdown 文件,需要 Word和PDF。
+> 但发给领导/同事时没人用 `.md` 文件。v2 加入了 Word 导出。
+
+> 🟢 **v3 新增说明**
 >
-> **修复方案:** > - 新增 `src/report_builder.py` 模块,统一管理 Word 和 PDF 的构建逻辑
+> v2 的 Word 报告解决了"发给同事"的问题,但还有两个场景没覆盖:
+> 1. **发给外部**:PDF 是跨平台标准格式,格式不会在对方电脑上错乱
+> 2. **内容完整性**:Word 报告只有文字和表格,**图表无法自动嵌入**;
+>    PDF 报告可以把本轮所有 Plotly 图表截图后嵌入文档,做到"所见即所得"
+>
+> **v3 修复方案:**
+> - 新增 `src/report_builder.py` 模块,统一管理 Word 和 PDF 的构建逻辑
 > - PDF 生成管线:`Markdown → HTML → (图表 PNG 嵌入) → PDF`
 > - 图表导出:`kaleido` 把 Plotly 图表渲染为 PNG bytes,Base64 编码后嵌入 HTML
 > - `output_format` 新增 `"pdf"` 和 `"all"` 选项
 
-**📋 Prompt 模板:**
+**📋 Prompt 模板(完整版,发给 Claude Code):**
 
 ```
-最后三个功能,做完 Week 3 就完整了。
+我已完成 Week3 前面所有任务。现在做 Day 22 的最后三个功能:
+主动洞察 + Word 报告 + PDF 报告(v3 新增)。
 
 【技术栈】
 - Word 导出: python-docx
 - PDF 导出: weasyprint + markdown + kaleido
 - 统一封装在: src/report_builder.py
 
-【任务 1: 主动洞察】
+---
 
-修改 prompts.py 的 AGENT_SYSTEM_PROMPT,加入:
+【任务 1: 主动洞察(修改 prompts.py)】
+
+在 AGENT_SYSTEM_PROMPT 中加入以下规则(插入到"主动洞察"区域):
+
 ```
 完成每一轮分析后,主动推荐下一步可深挖的方向。
 
@@ -1761,11 +1924,11 @@ Day 21: 接入 Agent + System Prompt 更新 + 完整测试
 
 规则:
 - 优先推荐发现的异常点(带具体数字)
-- 优先推荐有业务价值的方向
-- 不超过 3 个建议
-- 用数字编号方便用户快速选择
-- 不要重复推荐上一轮已经分析过的方向
+- 不超过 3 个建议,用数字编号
+- 不要重复推荐上一轮已分析过的方向
 ```
+
+---
 
 【任务 2: 新建 src/report_builder.py】
 
@@ -2228,7 +2391,6 @@ Step 3c: markdown_to_pdf()
 - **[v3]** weasyprint 未安装时有友好降级提示,不显示红色报错
 - **[v3]** 图表自动注册到 `chart_registry`,生成报告时统一提取嵌入 PDF
 
-
 ---
 
 ## 五、Week 4 · 求职作品包装
@@ -2295,7 +2457,7 @@ README 必须包含:
 AI 数据分析 Agent | 个人项目 | 2026.X
 个人开发的数据分析师 AI 助手,能通过自然语言完成数据查询、可视化、归因分析全流程。
 
-技术栈: Python | Streamlit | DeepSeek API | DuckDB | Plotly | python-docx
+技术栈: Python | Streamlit | DeepSeek API | DuckDB | Plotly | wordcloud | python-docx | weasyprint
 GitHub: github.com/xxx | Demo: xxx.streamlit.app
 
 核心亮点:
@@ -2303,11 +2465,11 @@ GitHub: github.com/xxx | Demo: xxx.streamlit.app
 • 用带意图标签的查询缓存机制解决跨轮数据污染问题,确保图表数据准确
 • 用 DuckDB 作为统一查询层,支持 Excel / CSV / 数据库的统一 SQL 访问
 • 实现归因诊断工具,自动完成指标拆解 + 维度下钻 + 贡献度量化(置信度由代码评估)
-• 加入图表类型自动校验层,防止 LLM 选错图表类型
-• 支持一键生成 Word 分析报告并下载
+• 支持 13 种图表类型(含词云图/漏斗图/气泡图),带自动类型校验与降级机制
+• 支持一键生成 Word 和 PDF 双格式分析报告,PDF 自动嵌入本轮所有图表截图
 ```
 
-**面试话术准备 7 个问题:**
+**面试话术准备 9 个问题:**
 
 1. 这个项目的设计思路是什么?
 2. 为什么选 DeepSeek?为什么不用 LangChain?
@@ -2316,8 +2478,24 @@ GitHub: github.com/xxx | Demo: xxx.streamlit.app
 5. 这个 Agent 的局限性是什么?如果在公司落地怎么改进?
 6. **你在做这个项目过程中发现了哪些设计问题,怎么修复的?**
 7. **为什么不直接把数据传给 Claude/Gemini 来分析?**
+8. **词云图、漏斗图、气泡图分别适合什么场景?你是怎么设计它们的参数 Schema 的?**
+9. **[v3 新增]** 你的报告支持 Word 和 PDF 两种格式,两者有什么区别?PDF 里的图表是怎么嵌入的?
 
-> 问题 6 和 7 是 v2 新增的,这两个问题能展示你的工程反思能力和系统性思维,是加分项。
+**问题 9 参考回答:**
+
+> "Word 适合需要继续编辑的场景,用 python-docx 生成,格式上能保留标题层级和表格。
+> PDF 适合直接发送存档的场景,格式固定不会错乱。
+>
+> PDF 里图表嵌入的技术路径是:每次 make_chart 渲染图表时,
+> 把 Plotly Figure 对象注册到 chart_registry。生成报告时,
+> 用 kaleido 把每个 Figure 渲染成 PNG bytes,Base64 编码后嵌入 HTML 的 img 标签。
+> 最后 weasyprint 把完整 HTML 渲染成 PDF。
+>
+> 这条管线的设计考虑了降级处理:kaleido 找不到时图表跳过但报告继续生成;
+> weasyprint 在 Windows 上安装复杂,代码里有 ImportError 捕获和友好提示,
+> 不会让用户看到红色报错。"
+
+> 问题 6 和 7 来自 v2。问题 8、9 是 v3 新增,展示图表设计和报告工程的深度。
 
 每个问题准备 1-2 分钟的回答,**对着镜子练 3 遍**。
 
@@ -2337,7 +2515,7 @@ AGENT_SYSTEM_PROMPT = """
 2. make_chart: 生成 Plotly 交互式图表(图表类型有自动校验)
 3. analyze_dataframe: 做基础统计分析
 4. diagnose_metric: 多维度归因诊断
-5. generate_report: 生成分析报告(支持 Word 下载)
+5. generate_report: 生成分析报告(支持 Markdown 展示 / Word 下载 / PDF 下载含图表截图)
 
 ## 工作原则
 
@@ -2387,6 +2565,9 @@ AGENT_SYSTEM_PROMPT = """
 - 占比 ≤5 类用 pie/donut
 - 不同量级双指标用 combo
 - 不确定时优先 bar 或 table
+- [v3] 文本词频可视化用 wordcloud,wordcloud_options 必须填 text_col 或 word_col+freq_col
+- [v3] 流程转化分析用 funnel,funnel_options 必须填 stage_col 和 value_col
+- [v3] 三维数值关系分析用 bubble,bubble_options 必须填 size_col
 
 ## 主动洞察
 
@@ -2483,35 +2664,317 @@ A: agent.py 主循环必须有 MAX_ITERATIONS 限制(建议 12),超过就强制�
 ### 功能完整性
 - [ ] 能上传 Excel/CSV 并查询
 - [ ] 能查询预置 Olist 数据集
-- [ ] 至少 7 种图表类型可用
+- [ ] 至少 13 种图表类型可用(含 v3 新增的词云/漏斗/气泡)
 - [ ] 图表类型校验层生效(饼图 >5 类自动降级)
 - [ ] make_chart 用 result_key 指定数据源
 - [ ] 能处理多步分析问题
 - [ ] 归因诊断工具能跑通(含贡献度计算)
 - [ ] 置信度由代码规则评估,不是 LLM 自评
-- [ ] 能生成 Word 报告并下载
+- [ ] 能生成 Word 报告并下载(含格式化标题/表格/页眉页脚)
+- [ ] **[v3]** 能生成 PDF 报告并下载(含 Plotly 图表截图嵌入)
+- [ ] **[v3]** `generate_report` 的 `output_format` 支持四种值:markdown/word/pdf/all
+- [ ] **[v3]** `chart_registry` 在每次 make_chart 时自动注册图表
+- [ ] **[v3]** weasyprint 未安装时显示友好提示而非红色报错
 - [ ] 多轮对话上下文连贯
 - [ ] 只有大查询(>10万行)才弹确认框
 - [ ] 错误能友好提示
+- [ ] **[v3]** 词云图能正确渲染并提供 PNG 下载
+- [ ] **[v3]** 中文词云在 Windows/Mac/Linux 三平台字体正确
+- [ ] **[v3]** 漏斗图自动排序 + 转化率标注 + 层间流失显示
+- [ ] **[v3]** 气泡图有中位数参考线 + 象限统计 + 悬停标签
+- [ ] **[v3]** 三种新图表的 validators 校验规则全部生效
 
 ### 工程质量
 - [ ] 代码有详细注释
 - [ ] 关键函数有 docstring
-- [ ] requirements.txt 包含 python-docx
-- [ ] validators.py 有单元测试
+- [ ] requirements.txt 包含 python-docx、wordcloud、matplotlib、weasyprint、markdown、kaleido
+- [ ] validators.py 有单元测试(含三种新图表的校验测试)
+- [ ] chart_utils.py 有单元测试(独立于 Streamlit 可运行)
+- [ ] report_builder.py 有单元测试(markdown_to_word / build_html_report 各一个)
+- [ ] assets/fonts/ 目录存在(README 中有字体配置说明)
 - [ ] .env.example 存在
 - [ ] .gitignore 排除敏感文件
+- [ ] README 包含 weasyprint Windows 安装说明
 
 ### 求职准备
 - [ ] 项目部署上线,有公开 URL
 - [ ] GitHub README 包含"为什么不直接用 Claude/Gemini"一节
 - [ ] 至少 1 篇技术复盘文章发布
-- [ ] 3-5 分钟 demo 视频录制完成
-- [ ] 简历项目描述写好(含 v2 修复的亮点)
-- [ ] 7 个面试问题准备好(含问题 6 和 7)
+- [ ] 3-5 分钟 demo 视频录制完成(包含 PDF 报告下载演示片段)
+- [ ] 简历项目描述写好(含 v3 PDF 报告能力)
+- [ ] 8 个面试问题准备好(含问题 6、7、8)
 
 ---
 
 完成所有这些,你就有了一个完整的、能讲能演示的 AI 数据分析 Agent 求职作品。
 
 祝你拿到心仪的 offer 🎯
+
+---
+
+## 附录 C · [v3 新增] 三种新图表的常见问题排查
+
+### 词云图
+
+**Q: 词云显示方块(□□□)怎么办?**
+
+A: 中文字体缺失,按顺序排查:
+1. 确认 `assets/fonts/SimHei.ttf` 存在(这是最可靠的方式)
+2. `get_font_path()` 加 `print` 输出,确认返回的路径真实存在
+3. Streamlit Cloud 部署时在项目根目录加 `packages.txt`,内容:
+   ```
+   fonts-wqy-zenhei
+   ```
+4. 葡萄牙语数据不需要中文字体,只有输出的关键词是中文时才需要
+
+**Q: 词云生成很慢怎么办?**
+
+A: `wordcloud` 库本身的布局算法比较耗时,可以:
+1. 降低 `max_words`(80 比 200 快很多)
+2. 降低 `width × height`(900×450 比 1800×900 快 4 倍)
+3. 预先统计词频再传入(格式二),跳过分词步骤
+4. 把词云生成放在 `st.spinner` 里,提示用户稍等
+
+**Q: 词云出现大量无意义词(的/了/是...)怎么办?**
+
+A: 停用词问题:
+1. 中文: jieba 有内置停用词,另外在 `WordCloud` 里加 `stopwords` 参数
+2. 葡萄牙语: 手动维护一个停用词列表(de/da/do/em/que/para...)
+3. 通用处理: 过滤长度 ≤ 1 的词、纯数字词
+
+---
+
+### 漏斗图
+
+**Q: 漏斗各层不是从大到小排列怎么办?**
+
+A: 代码里的 `sort_values(ascending=False)` 会自动排序,但要确认:
+1. `value_col` 是数值类型,不是字符串
+2. 如果用户的"漏斗"阶段有业务顺序(如 created → approved → shipped),
+   需要先给阶段加数字前缀再排序:
+   ```sql
+   CASE order_status
+       WHEN 'created'   THEN '1.已创建'
+       WHEN 'approved'  THEN '2.已批准'
+       ...
+   END AS stage
+   ```
+
+**Q: 漏斗图层间转化率标注位置错乱怎么办?**
+
+A: `go.Figure annotation` 的坐标系问题:
+- `x=0.5` 是 paper 坐标(相对整个图表宽度),不是数据坐标
+- `y=i - 0.5` 是近似位置,实际位置取决于漏斗层的高度
+- 如果标注重叠,调整 `y` 的计算公式或改用 `textinfo` 把信息嵌在漏斗层内
+
+---
+
+### 气泡图
+
+**Q: 气泡都挤在一起看不清怎么办?**
+
+A: 几种处理方式:
+1. 减小 `size_max`(从 60 降到 30)
+2. 对 `size_col` 做对数变换: `df['size_log'] = np.log1p(df[size_col])`
+3. 过滤异常大的数据点(头部效应导致其他点都很小)
+4. 减少数据点数量(SQL 里加 `LIMIT` 或提高 `HAVING COUNT > N` 的阈值)
+
+**Q: 气泡图 X/Y 轴有极端值影响整体分布怎么办?**
+
+A: 在 `fig.update_layout` 里手动设置轴范围:
+```python
+fig.update_xaxes(range=[df[x_col].quantile(0.05), df[x_col].quantile(0.95)])
+fig.update_yaxes(range=[df[y_col].quantile(0.05), df[y_col].quantile(0.95)])
+```
+同时显示提示:"已排除 5% 极端值以提高图表可读性"
+
+**Q: 中位数参考线和数据点标签重叠怎么办?**
+
+A: 气泡图不建议直接标注每个气泡的名称(数据点多时会很乱),正确做法:
+- 气泡名称通过 `hover_name` 悬停显示
+- 如果确实需要标注,只标注最大/最小的几个气泡:
+  ```python
+  top3 = df.nlargest(3, size_col)
+  for _, row in top3.iterrows():
+      fig.add_annotation(x=row[x_col], y=row[y_col], text=row[label_col], ...)
+  ```
+
+---
+
+## 附录 D · [v3 新增] PDF 报告常见问题排查
+
+### 安装问题
+
+**Q: Windows 上安装 weasyprint 报错怎么办?**
+
+A: weasyprint 依赖 GTK 运行时,Windows 原生安装较复杂。按优先级选择:
+
+方案 1(推荐):用 **WSL2** 开发
+```bash
+# 在 WSL2 Ubuntu 环境里安装
+sudo apt-get install python3-weasyprint
+pip install weasyprint
+```
+
+方案 2:按官方文档安装 GTK
+- 访问 https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#windows
+- 下载 GTK 运行时安装包(约 150MB)
+- 安装后重启,再 `pip install weasyprint`
+
+方案 3:用 **fpdf2** 替代(纯 Python,无外部依赖)
+```bash
+pip install fpdf2
+```
+fpdf2 不能直接渲染 HTML,需要手动逐段写入 PDF。
+格式比 weasyprint 简单,但不需要 GTK,所有平台开箱即用。
+fpdf2 版本的 `markdown_to_pdf` 实现思路:
+```python
+from fpdf import FPDF
+import re
+
+def markdown_to_pdf_fpdf(markdown_content: str, title: str) -> bytes:
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    
+    # 添加中文字体(需要 TTF 文件)
+    pdf.add_font('SimHei', '', 'assets/fonts/SimHei.ttf', uni=True)
+    
+    for line in markdown_content.split('\n'):
+        if line.startswith('# '):
+            pdf.set_font('SimHei', size=18)
+            pdf.cell(0, 12, line[2:], ln=True)
+        elif line.startswith('## '):
+            pdf.set_font('SimHei', size=14)
+            pdf.cell(0, 10, line[3:], ln=True)
+        elif line.strip():
+            pdf.set_font('SimHei', size=11)
+            pdf.multi_cell(0, 7, line)
+    
+    return pdf.output(dest='S').encode('latin-1')
+```
+注意:fpdf2 嵌入图表需要先把 PNG bytes 写入临时文件再引用,
+比 weasyprint 的 Base64 方式稍麻烦。
+
+**Q: pip install kaleido 之后图表还是导出失败?**
+
+A: kaleido 依赖 Chromium 内核,常见问题:
+1. `pip install kaleido` 之后需要**重启 Python 进程**
+2. 检查版本:kaleido 0.2.x 和 1.x 的 API 有差异
+   - Plotly 5.x 推荐用 kaleido 0.2.1: `pip install kaleido==0.2.1`
+3. Linux 服务器上可能缺少 chromium 依赖:
+   ```bash
+   sudo apt-get install -y chromium-browser
+   ```
+4. Streamlit Cloud 部署时需在 `packages.txt` 加:
+   ```
+   chromium-driver
+   ```
+
+---
+
+### 生成质量问题
+
+**Q: PDF 中中文显示为方块怎么办?**
+
+A: weasyprint 中文字体问题与词云不同,处理方式也不同:
+
+1. **CSS 字体声明法(推荐)**:在 `build_html_report` 的 CSS 里声明字体栈:
+   ```css
+   body { font-family: 'Microsoft YaHei', 'SimHei', 'STHeiti',
+                        'WenQuanYi Zen Hei', sans-serif; }
+   ```
+   weasyprint 会按顺序找系统字体,找到一个能显示中文的就用
+
+2. **嵌入字体文件法**:在 CSS 里用 `@font-face` 嵌入 TTF 文件:
+   ```css
+   @font-face {
+       font-family: 'CustomFont';
+       src: url('assets/fonts/SimHei.ttf');
+   }
+   body { font-family: 'CustomFont', sans-serif; }
+   ```
+
+3. **Streamlit Cloud 部署时**:在 `packages.txt` 加:
+   ```
+   fonts-wqy-zenhei
+   fonts-noto-cjk
+   ```
+
+**Q: PDF 里的图表截图模糊怎么办?**
+
+A: 调高 kaleido 的导出分辨率:
+```python
+# 在 export_chart_as_png 里调整参数
+fig.to_image(format="png", width=1200, height=600, scale=3)
+# scale=3 相当于 3 倍分辨率,适合 A4 打印
+# 但文件会变大,建议 scale=2 作为平衡点
+```
+
+**Q: PDF 页面排版乱(图表溢出边界/表格断行)怎么办?**
+
+A: 调整 CSS 中的页面设置:
+```css
+@page {
+    size: A4;
+    margin: 20mm 25mm;   /* 上下/左右边距,太小容易溢出 */
+}
+img {
+    max-width: 100%;      /* 图片不超过页宽 */
+    page-break-inside: avoid;  /* 图片不在页面中间断开 */
+}
+table {
+    page-break-inside: avoid;  /* 小表格不断页 */
+}
+h2 {
+    page-break-before: auto;   /* 二级标题前不强制换页 */
+}
+```
+
+**Q: PDF 文件太大怎么办?**
+
+A: 几种减小体积的方式:
+1. 降低图表导出分辨率:`scale=1` 替代 `scale=2`
+2. 减小图表尺寸:`width=800, height=400` 替代 `width=1200, height=600`
+3. 对于图表数量多的报告,`embed_charts=False` 生成无图版 PDF
+4. 图表超过 5 张时,只嵌入用户标记为"重要"的图表
+   (可以在 make_chart 里加一个 `is_key_chart: bool` 参数控制)
+
+---
+
+### 部署问题
+
+**Q: Streamlit Cloud 上 PDF 生成失败怎么办?**
+
+A: Streamlit Cloud 是 Linux 环境,检查:
+
+1. `requirements.txt` 包含 `weasyprint` 和 `kaleido`
+2. `packages.txt`(系统包)包含:
+   ```
+   libpango-1.0-0
+   libpangocairo-1.0-0
+   libgdk-pixbuf2.0-0
+   libffi-dev
+   shared-mime-info
+   fonts-wqy-zenhei
+   chromium-driver
+   ```
+3. 如果上述系统包安装后还失败,改用 fpdf2 方案(见上方 Windows 部分)
+
+**Q: 本地能生成 PDF,部署到 Streamlit Cloud 后不行?**
+
+A: 原因通常是 Streamlit Cloud 的 Linux 容器缺少系统依赖。
+最可靠的诊断方式是在 `html_to_pdf` 里加日志:
+```python
+def html_to_pdf(html_content: str) -> bytes:
+    try:
+        from weasyprint import HTML
+        return HTML(string=html_content).write_pdf()
+    except ImportError:
+        raise ImportError("weasyprint 未安装,请执行 pip install weasyprint")
+    except Exception as e:
+        # 打印详细错误到 Streamlit Cloud 的日志
+        print(f"PDF 生成失败: {type(e).__name__}: {e}")
+        raise
+```
+然后在 Streamlit Cloud 的 Logs 页面查看具体报错信息。

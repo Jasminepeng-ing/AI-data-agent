@@ -17,21 +17,90 @@ Agent 主循环：基于 DeepSeek Function Calling 实现多步推理。
 """
 
 import json
+import re
 from openai import OpenAI
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, MODEL_NAME, LARGE_QUERY_ROW_THRESHOLD
 from tools import TOOLS_SCHEMA, execute_tool
 
+# 词云关键词正则：中英文全覆盖
+_WORDCLOUD_RE = re.compile(r'词云|word\s*cloud|wordcloud', re.IGNORECASE)
+
 MAX_ITERATIONS = 12
+MAX_CONTEXT_CHARS = 50_000  # 超过此字符数时触发历史截断
+KEEP_ROUNDS = 6             # 始终保留最近 N 轮完整对话
+
+
+def _trim_messages(messages: list) -> list:
+    """
+    当 messages 总字符数超过 MAX_CONTEXT_CHARS 时，裁剪旧轮次以节省 token：
+    - 始终保留：system message + 最新 KEEP_ROUNDS 轮完整对话
+    - 对旧轮次：保留 user 消息 + assistant 最终文字回答，删除 tool / tool_calls 细节
+    - 如果裁剪后仍超限，旧轮次整体丢弃（不会影响最近 KEEP_ROUNDS 轮）
+
+    兼容 messages 中混有 OpenAI ChatCompletionMessage 对象（非 dict）的情况。
+    """
+    def _role(m) -> str:
+        return m.get("role") if isinstance(m, dict) else getattr(m, "role", "")
+
+    def _content(m) -> str:
+        c = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+        return c or ""
+
+    total = sum(len(_content(m)) for m in messages)
+    if total <= MAX_CONTEXT_CHARS:
+        return messages
+
+    system_msg = messages[0]
+    rest = messages[1:]
+
+    # 按 user 消息边界切分轮次
+    turns: list[list] = []
+    current: list = []
+    for m in rest:
+        if _role(m) == "user" and current:
+            turns.append(current)
+            current = [m]
+        else:
+            current.append(m)
+    if current:
+        turns.append(current)
+
+    if len(turns) <= KEEP_ROUNDS:
+        return messages  # 轮次不多，不截断
+
+    old_turns = turns[:-KEEP_ROUNDS]
+    recent_turns = turns[-KEEP_ROUNDS:]
+
+    def slim_turn(turn: list) -> list:
+        """旧轮次瘦身：只保留 user + assistant 纯文字，丢弃 tool 消息和 tool_calls。"""
+        result = []
+        for m in turn:
+            r = _role(m)
+            if r == "user":
+                # user 消息一定是 dict，直接保留
+                result.append(m if isinstance(m, dict) else {"role": "user", "content": _content(m)})
+            elif r == "assistant":
+                text = _content(m)
+                if text:  # 只保留有实际文字内容的 assistant 消息（最终回答）
+                    result.append({"role": "assistant", "content": text})
+            # tool 消息直接丢弃（占空间最多）
+        return result
+
+    slimmed = [msg for t in old_turns for msg in slim_turn(t)]
+    recent = [msg for t in recent_turns for msg in t]
+    return [system_msg] + slimmed + recent
 
 # Agent 的 system prompt：角色是会用工具的分析师，而非单纯 SQL 生成器
 AGENT_SYSTEM_PROMPT = """\
 你是一个专业的 AI 数据分析助手，通过调用工具完成数据查询、可视化和统计分析任务。
 
 【可用工具】
-1. query_database  — 执行 SQL 查询获取数据（必须先于 make_chart / analyze_dataframe 调用）
-2. make_chart      — 对已查询的数据绘制图表（bar/line/pie/scatter）
+1. query_database    — 执行 SQL 查询获取数据（必须先于 make_chart / analyze_dataframe 调用）
+2. make_chart        — 对已查询的数据绘制图表（bar/line/pie/scatter 等 10 种）
 3. analyze_dataframe — 对已查询的数据做统计分析（describe/correlation/groupby_summary）
+4. diagnose_metric   — 多维度归因分析：自动查询两期数据、量化各维度贡献度、生成归因结论
+                       适用场景："为什么 X 指标下跌了" / "X 指标变化的原因" / "X 指标归因分析"
 
 【数据库结构】
 {schema_text}
@@ -47,7 +116,11 @@ AGENT_SYSTEM_PROMPT = """\
 6. 不得添加用户未明确要求的 WHERE 过滤条件。
    - 严禁自行加 order_status != 'canceled'（或任何状态过滤）——
      用户未说"只看已完成订单"，就必须查全量数据，canceled 订单也包含在内。
+   - **严禁以"提升图表质量""数据太少没意义"为由自行加数量阈值过滤**，
+     例如 `WHERE order_count >= 10`、`HAVING COUNT(*) > 5` 等均属禁止。
+     用户问"所有品类的平均价格和评分"，就必须返回所有品类，哪怕某个品类只有 1 笔订单。
    - 同理严禁自行加时间范围之外的任何业务过滤。
+   - 上述规则不因 SQL 注释（如 `-- 过滤订单量太少的品类`）或"合理性解释"而豁免。
 7. 用户说的"X 中…"是分组维度，不是过滤条件，不得因此加 WHERE。
 8. 【歧义消解——增跌排名默认用百分比】
    用户问"下跌/增长/变化最大/最严重/最快"等排名类问题时，
@@ -76,6 +149,49 @@ AGENT_SYSTEM_PROMPT = """\
       WHERE o."order_purchase_timestamp" >= '2017-07-01'
         AND p."product_category_name" IS NOT NULL
 
+11. 【同比 vs 环比——严格区分，禁止混用】
+    同比（YoY，Year-over-Year）= 当期 vs 上一年同一时间段
+      公式：(当期 - 上年同期) / 上年同期 × 100%
+      SQL：月度用 LAG(val, 12) OVER (ORDER BY year_month)
+           季度用 LAG(val, 4)  OVER (ORDER BY year_quarter)
+    环比（MoM/QoQ，Month/Quarter-over-Month/Quarter）= 当期 vs 紧邻上一个统计周期
+      公式：(当期 - 上期) / 上期 × 100%
+      SQL：月度用 LAG(val, 1) OVER (ORDER BY year_month)
+           季度用 LAG(val, 1) OVER (ORDER BY year_quarter)
+    判断规则：
+    - 用户说"环比"→ 一律用 LAG(val, 1)（紧邻上一期）
+    - 用户说"同比"→ 一律用 LAG(val, 12)（月）或 LAG(val, 4)（季）
+    - 严禁把"环比"写成跨年的 LAG(val, 12)，那是同比逻辑
+
+12. 【环比/同比的跨年边界问题——必须包含前置期数据】
+    当分析范围从某年 1 月开始时，该年 1 月的环比需要上一年 12 月数据；
+    若 SQL 直接 WHERE year = 2017，则 LAG(1) 在 1 月处得到 NULL，无法计算。
+    正确做法：在 CTE 里多拉取前置期，LAG 计算完成后外层再 WHERE 过滤回目标年份。
+    示例（2017 年月度环比，需先包含 2016 年 12 月）：
+      WITH base AS (
+        SELECT customer_state, YEAR(ts) AS yr, MONTH(ts) AS mo, SUM(amount) AS total
+        FROM orders
+        WHERE ts >= '2016-12-01' AND ts < '2018-01-01'   -- 多拉 2016-12
+        GROUP BY customer_state, yr, mo
+      ),
+      with_lag AS (
+        SELECT *,
+          LAG(total, 1) OVER (PARTITION BY customer_state ORDER BY yr, mo) AS prev,
+          ROUND((total - LAG(total,1) OVER (PARTITION BY customer_state ORDER BY yr, mo))
+                / NULLIF(LAG(total,1) OVER (PARTITION BY customer_state ORDER BY yr, mo), 0) * 100, 2
+          ) AS mom_pct
+        FROM base
+      )
+      SELECT * FROM with_lag WHERE yr = 2017     -- 最终只展示目标年份
+    同理，若计算某年第一季度的同比，CTE 需多拉上一年同期（yr-1 同季度）。
+
+【上下文记忆（充分利用对话历史）】
+你能看到完整的对话历史，请充分利用：
+- **理解代词指向**："那再看看华南地区"中的"那"指上一轮的分析主题，不要重新发问，直接延续
+- **沿用用户定义的术语**：如用户说过"活跃用户=最近30天有下单"，后续提到"活跃用户"时直接沿用此定义
+- **避免重复查询**：历史消息中已出现的数据结论，不要再次调用 query_database 重复查，直接引用已有结论
+- **推进分析深度**：上一轮已分析过的维度，本轮主动推荐更深层的下钻维度（如已看过大区→建议细化到省份）
+
 【工作方式】
 - 分析用户需求，规划工具调用顺序（查询 → 可选绘图 / 分析），按顺序调用。
 - 所有工具调用完成后，用中文向用户解释结果，提供数据洞察和建议。
@@ -102,6 +218,117 @@ AGENT_SYSTEM_PROMPT = """\
 - 目标数据已通过 query_database 查询完毕（result_key 对应的 intent 存在）
 - 对比图需要两组数据都查完才能画，不能用同一个 result_key 画两条线
 - 必须通过 result_key 参数明确指定画哪次查询的数据，不要依赖默认值
+
+【diagnose_metric 使用规则】
+
+触发时机：用户问"为什么 X 变了""X 下跌/上涨的原因""X 指标归因分析"等，
+首选 diagnose_metric，不要用 query_database 手工拼多条 SQL。
+
+调用前必须在心里确认以下三点（若用户描述不清，先用文字追问再调工具）：
+  ① 指标定义：销售额 = 价格之和 还是 含运费？订单数 = 下单数 还是 完成数？
+  ② 对比时期：用户说的 A 期 / B 期是哪两段（结合数据库实际时间范围判断）
+  ③ 下钻维度：基于业务理解，通常包括 品类 / 州 / 支付方式，最多选 4 个
+
+参数填写规则：
+- base_sql 只写 SELECT 聚合 + FROM/JOIN，不含 WHERE；聚合别名必须写 metric_value
+- filter_sql 用标准格式：
+    季度：EXTRACT(YEAR FROM o.order_purchase_timestamp) = 2017 AND EXTRACT(QUARTER FROM o.order_purchase_timestamp) = 3
+    月份：o.order_purchase_timestamp >= '2017-10-01' AND o.order_purchase_timestamp < '2018-01-01'
+- drill_dimensions 建议 2-4 个，常用维度：品类（需 extra_join 翻译表）、州、支付方式
+- 品类维度的 extra_join 固定写法：
+    LEFT JOIN "products" p ON oi."product_id" = p."product_id"
+    LEFT JOIN "product_category_name_translation" t ON p."product_category_name" = t."product_category_name"
+  dimension_col 对应写 t.product_category_name_english
+
+输出归因结论时，必须包含以下 5 项（工具返回后由你组织语言呈现）：
+  1. 总体变化量：绝对值 + 百分比（如"销售额从 120 万降至 95 万，环比 -20.8%"）
+  2. Top 3 贡献因素：各自的变化量 + 贡献度百分比
+  3. 置信度评估：直接引用工具返回的置信度（高/中/低），不得自行修改或重新评估
+  4. 局限性说明：哪些因素缺少数据支撑（如促销活动、外部竞争、季节性未建模）
+  5. 建议下一步动作：具体可执行（如"对贡献度最高的品类做 diagnose_metric 二次下钻"）
+
+【图表类型用户需求优先规则（最重要，必须遵守）】
+用户在提问中明确说了要用什么图表类型时（如"画饼图""用折线图""做柱状图""生成词云图"），必须按以下流程处理：
+
+⚠️ 词云图特殊规则（优先级最高）：
+  用户说"词云"/"词云图"/"word cloud" → 必须调用 make_chart(chart_type="wordcloud", ...)
+  - 不得用 barh 或 bar 代替，即使你已经有了频次数据
+  - 必须附带 wordcloud_options（见【图表选择规则】中的词云条目）
+  - 词云图属于"合适"类型，直接用 chart_source="user_requested"，不用画第二张 barh
+
+情况 A：你认为用户要求的图表类型**合适**
+  → 直接调用 make_chart，设 force_chart_type=true，chart_source="user_requested"
+  → 只调用一次，不额外再画一张
+
+情况 B：你认为用户要求的图表类型**不合适**（如饼图类别太多、折线图 X 轴不是时间）
+  → 第一次调用 make_chart：chart_type=用户要求的类型，force_chart_type=true，
+     chart_source="user_requested"（强制绘制用户要求的图）
+  → 第二次调用 make_chart：chart_type=你推荐的类型，force_chart_type=false（不设），
+     chart_source="ai_recommended"（你认为更合适的图）
+  → 两张图同时展示给用户，让用户自己选择
+  → 在最终文字回复中说明：你在展示两张图，第一张是用户要求的，第二张是你推荐的及原因
+
+情况 C：用户**未指定**图表类型
+  → 按正常规则选择最合适的类型，force_chart_type 不填（或填 false），chart_source="normal"
+
+【图表选择规则（代码层会自动校验，但请尽量选对）】
+- 禁止使用 3D 饼图（视觉严重失真）
+- 类别 > 5 个不要用 pie / donut，改用 barh（横向条形图）
+- 时间序列优先选 line，X 轴必须是时间字段（日期 / 年月 / 季度）
+- 分类字段的对比优先选 bar（≤8类）或 barh（>8类 或 类别名很长）
+- 两个不同量级的双指标（如订单量 + 转化率）选 combo 双轴图
+- wordcloud（词云图）：**用户说"词云"/"词云图"时，必须使用此类型，禁止用 barh 代替**
+  调用规则：
+  ① x_col、y_col、x_axis_label、y_axis_label 全部不填（词云不需要轴）
+  ② 必须提供 wordcloud_options，两种模式二选一：
+     - 已聚合（有词列+频次列，最常见场景）：
+         word_col = 词语/词汇所在列名
+         freq_col = 频次/数量所在列名（必须是数值列）
+       示例：query 结果有 [word, frequency] 两列 →
+         wordcloud_options: {{"word_col": "word", "freq_col": "frequency"}}
+     - 原始文本（有未分词的文本列）：
+         text_col = 评论/描述文本列名
+         language = "en"（葡语/英语）或 "zh"（中文）
+       示例：query 结果有 review_comment_message 列 →
+         wordcloud_options: {{"text_col": "review_comment_message", "language": "en"}}
+  ③ 用户同时要词云且你已查到词频数据 → 直接用已查数据的 word_col+freq_col，不用再查一遍原始文本
+- bubble（气泡图）：同时展示三个数值维度的关系
+  选择条件（同时满足才用）：
+  ① 用户问题涉及"三个数值维度"的关系分析
+  ② 有合适的"大小"语义字段（如销量、金额、用户数），能表达权重或规模
+  ③ 数据点数量在 5-100 之间（太少没意义，太多气泡重叠）
+  调用时必须填写 bubble_options.size_col（区别于普通散点图的关键参数）；
+  建议同时填 label_col（数据点名称，悬停时显示）。
+  典型触发词："三维分析"/"大小表示"/"气泡"/"...和...和...的关系"
+  示例：各品类的平均价格（X）× 平均评分（Y）× 订单量（气泡大小）→
+    x_col="avg_price", y_col="avg_score",
+    bubble_options: {{"size_col": "order_count", "label_col": "category"}}
+- 不确定图表类型时，优先选 bar 或 table（最不容易出错）
+- 调用 make_chart 时必须填 result_key，明确说明要画哪次查询的数据
+- heatmap 专项规则：x_col=横轴分类（如月份），y_col=纵轴分类（如州名），
+  color_col=必填，填要展示的指标列名（如展示环比率填'mom_change_pct'，
+  展示金额填'total_amount'）；若 color_col 填错，热力图颜色将显示错误列
+
+【多系列图表规则（bar / barh / line 专属）】
+make_chart 支持两种多系列模式，根据查询返回的数据格式选择：
+
+模式 A — 宽格式（每列是一个系列）：
+  数据示例：月份 | Q1销售额 | Q2销售额 | Q3销售额 | Q4销售额
+  参数写法：x_col="月份", y_cols=["Q1销售额","Q2销售额","Q3销售额","Q4销售额"]
+  适用场景：对比同一维度下多个并列指标，SQL 用 PIVOT 或 CASE WHEN 生成宽格式列
+
+模式 B — 长格式（有分组字段）：
+  数据示例：月份 | 品类 | 销量
+  参数写法：x_col="月份", y_col="销量", color_col="品类"
+  适用场景：GROUP BY 两个维度后出来的长格式，直接用 color_col 区分系列
+
+判断规则：
+- 用户问"对比各季度 / 各月 / 多个品类的 XXX"→ 优先考虑多系列
+- 查询结果中有多个数值列 → 用 y_cols（宽格式）
+- 查询结果中有一个分组字段 + 一个数值列 → 用 y_col + color_col（长格式）
+- y_cols 中每列必须是数值类型，非数值列请先在 SQL 中转换
+- 系列数建议 ≤ 6 个，超过 15 个会触发警告
+- pie / donut / scatter 不支持 y_cols，代码会自动降级为 bar
 """
 
 
@@ -166,12 +393,30 @@ def run_agent(
             continue
         messages.append({"role": msg["role"], "content": content})
 
-    messages.append({"role": "user", "content": user_message})
+    # 词云关键词检测：若用户明确要求词云，在消息末尾追加强制提醒，防止 LLM 降级为 barh
+    if _WORDCLOUD_RE.search(user_message):
+        _wc_reminder = (
+            "\n\n【强制绘图要求 - 必须严格执行】\n"
+            "1. 用户明确要求词云图。wordcloud 库已正确安装，可以正常使用，"
+            "严禁在回答中说任何关于库未安装/环境缺少依赖的内容。\n"
+            "2. 完成数据查询后，必须调用 make_chart，"
+            "参数 chart_type 必须填 'wordcloud'，同时填写 wordcloud_options。\n"
+            "3. 如果查询结果含词语列+频次列，填 word_col 和 freq_col；"
+            "如果含原始文本列，填 text_col。\n"
+            "4. 严禁用 barh/bar 代替词云图。不遵守此规则视为严重错误。"
+        )
+        enforced_message = user_message + _wc_reminder
+    else:
+        enforced_message = user_message
+    messages.append({"role": "user", "content": enforced_message})
 
     tool_calls_log: list[dict] = []
     step_count = 0  # 跨 iteration 的工具调用全局步骤号，用于 UI 步骤展示
 
     for iteration in range(MAX_ITERATIONS):
+        # ── Token 管理：超出上下文限制时裁剪旧轮次 ─────────────────────────
+        messages = _trim_messages(messages)
+
         # ── 调用 LLM ────────────────────────────────────────────────────────
         try:
             response = client.chat.completions.create(
@@ -255,8 +500,11 @@ def run_agent(
                     f"**第 {step_count} 步** 🔧 `{tool_name}` — {intent_hint}"
                 )
 
-            # 执行工具
-            tool_result = execute_tool(tool_name, args, ds)
+            # 执行工具（若用户要求词云，传入标志让工具层兜底纠正）
+            tool_result = execute_tool(
+                tool_name, args, ds,
+                user_wants_wordcloud=bool(_WORDCLOUD_RE.search(user_message)),
+            )
 
             tool_calls_log.append({
                 "step":      step_count,

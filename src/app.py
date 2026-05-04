@@ -156,6 +156,26 @@ def init_session_state() -> None:
 def render_sidebar(ds: DataSource) -> None:
     with st.sidebar:
         st.title("📊 数据源管理")
+
+        # ── 清空对话按钮 ─────────────────────────────────────────────────────
+        if st.button("🗑️ 清空对话", use_container_width=True, help="清空所有对话记录和本轮查询结果"):
+            st.session_state.messages = [
+                {
+                    "role": "assistant",
+                    "content": (
+                        "你好！我是你的 AI 数据分析助手 🤖\n\n"
+                        "我已加载 **Olist 巴西电商数据集**（9 张表，共约 150 万行数据）。\n\n"
+                        "你可以在左侧查看数据表结构，也可以上传自己的 Excel / CSV 文件。\n\n"
+                        "有什么想分析的，直接告诉我！"
+                    ),
+                }
+            ]
+            st.session_state.query_results = {}
+            st.session_state.latest_query_key = None
+            st.session_state._agent_charts = []
+            st.session_state.pending = None
+            st.rerun()
+
         st.divider()
 
         # ── 区域 1：Schema 展示 ──────────────────────────────────────────────
@@ -258,7 +278,7 @@ def render_sidebar(ds: DataSource) -> None:
         # ── 区域 3：历史 SQL 记录 ────────────────────────────────────────────
         if st.session_state.sql_history:
             st.divider()
-            st.subheader("🕘 历史 SQL 记录")
+            st.subheader("🕘 历史查询记录")
             st.caption("点击 ▶ 可重新提交到 Agent")
             for i, item in enumerate(st.session_state.sql_history):
                 display = item["question"][:22] + "…" if len(item["question"]) > 22 else item["question"]
@@ -272,7 +292,7 @@ def render_sidebar(ds: DataSource) -> None:
         query_results = st.session_state.get("query_results", {})
         if query_results:
             st.divider()
-            st.subheader("🔎 本轮已执行查询")
+            st.subheader("🔎 已执行SQL记录")
             st.caption("Agent 本次会话中执行的查询，点击 📋 查看 SQL")
 
             # 按时间倒序展示（字典插入顺序即时间顺序）
@@ -317,6 +337,37 @@ _AMOUNT_KEYWORDS = {
     "金额", "价格", "收入", "费用", "成本", "总额", "货款",
 }
 
+# 列名含以下关键词时，合计行用算术均值（mean）
+_AVG_KEYWORDS = {
+    "avg", "average", "mean", "score", "rating",
+    "均值", "平均", "评分", "分数",
+}
+
+# 列名含以下关键词时，合计行用中位数（median）
+_MEDIAN_KEYWORDS = {"median", "中位数"}
+
+# 列名含以下关键词时，合计行用众数（mode，取频次最高的值）
+_MODE_KEYWORDS = {"mode", "众数"}
+
+# 列名含以下关键词时，合计行用最大值
+_MAX_KEYWORDS = {"max", "maximum", "最大值", "最大"}
+
+# 列名含以下关键词时，合计行用最小值
+_MIN_KEYWORDS = {"min", "minimum", "最小值", "最小"}
+
+# 列名含以下关键词时，合计行显示"—"（比率/增速无法合计）
+_RATIO_KEYWORDS = {
+    "rate", "ratio", "pct", "percent", "proportion", "growth",
+    "mom", "yoy", "change", "delta", "diff",
+    "环比", "同比", "占比", "比率", "比例", "增速", "增幅", "变化",
+}
+
+# 所有"非求和"类关键词（用于决定首列标签）
+_SPECIAL_AGG_KEYWORDS = (
+    _AVG_KEYWORDS | _MEDIAN_KEYWORDS | _MODE_KEYWORDS
+    | _MAX_KEYWORDS | _MIN_KEYWORDS
+)
+
 
 def _is_amount_col(col_name: str) -> bool:
     """列名（忽略大小写）含金额关键词则返回 True。"""
@@ -324,11 +375,48 @@ def _is_amount_col(col_name: str) -> bool:
     return any(kw in lower for kw in _AMOUNT_KEYWORDS)
 
 
+def _total_agg(col_name: str, series: pd.Series):
+    """
+    根据列名语义决定合计行的聚合方式（优先级从上到下匹配）：
+    - 比率/增速类（环比/同比/pct/rate 等）→ "—"（无意义求和）
+    - 中位数类（median/中位数）            → 实际中位数
+    - 众数类（mode/众数）                  → 实际众数（频次最高值）
+    - 最大值类（max/最大值）               → 实际最大值
+    - 最小值类（min/最小值）               → 实际最小值
+    - 均值类（avg/score/rating 等）        → 算术平均
+    - 其他数值列                           → 求和
+    """
+    lower = col_name.lower()
+    if any(kw in lower for kw in _RATIO_KEYWORDS):
+        return "—"
+    if any(kw in lower for kw in _MEDIAN_KEYWORDS):
+        return round(series.median(), 4)
+    if any(kw in lower for kw in _MODE_KEYWORDS):
+        mode_vals = series.mode()
+        return round(mode_vals.iloc[0], 4) if len(mode_vals) > 0 else "—"
+    if any(kw in lower for kw in _MAX_KEYWORDS):
+        return series.max()
+    if any(kw in lower for kw in _MIN_KEYWORDS):
+        return series.min()
+    if any(kw in lower for kw in _AVG_KEYWORDS):
+        return round(series.mean(), 4)
+    return series.sum()
+
+
 # ── 合计行辅助函数 ────────────────────────────────────────────────────────────
 def _render_dataframe_with_total(df: pd.DataFrame) -> None:
     """
     将合计行直接拼接到主表末尾，渲染为同一个 st.dataframe 的最后一行。
     合计行用浅蓝背景高亮，下载时一并导出。
+
+    聚合规则（按列名语义）：
+    - 比率/增速类（环比/同比/pct/rate 等）→ "—"
+    - 中位数类（median/中位数）            → 实际中位数
+    - 众数类（mode/众数）                  → 实际众数
+    - 最大值类（max/最大值）               → 实际最大值
+    - 最小值类（min/最小值）               → 实际最小值
+    - 均值类（avg/score/rating 等）        → 算术平均
+    - 其他数值列                           → 求和
     """
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
     float_cols   = df.select_dtypes(include="float").columns.tolist()
@@ -338,12 +426,18 @@ def _render_dataframe_with_total(df: pd.DataFrame) -> None:
         st.dataframe(df, use_container_width=True)
         return
 
+    # 判断是否存在"非求和"类列，决定首列标签
+    has_special_col = any(
+        any(kw in c.lower() for kw in _SPECIAL_AGG_KEYWORDS) for c in numeric_cols
+    )
+    first_label = "合计 / 统计" if has_special_col else "合计"
+
     total: dict = {}
     for i, col in enumerate(df.columns):
         if i == 0:
-            total[col] = "合计"
+            total[col] = first_label
         elif col in numeric_cols:
-            total[col] = df[col].sum()
+            total[col] = _total_agg(col, df[col].dropna())
         else:
             total[col] = "—"
     total_df  = pd.DataFrame([total])
@@ -425,9 +519,61 @@ def _render_message(msg: dict) -> None:
         if msg.get("dataframe") is not None:
             _render_dataframe_with_total(msg["dataframe"])
 
-        # ── 图表（Week 2）────────────────────────────────────────────────────
-        for chart in msg.get("charts") or []:
-            st.plotly_chart(chart, use_container_width=True)
+        # ── 图表（Week 3：含 warning / insight / 原始数据 expander）──────────
+        for i, chart in enumerate(msg.get("charts") or []):
+            if isinstance(chart, dict):
+                chart_kind   = chart.get("chart_kind", "plotly")
+                fig          = chart.get("fig")
+                warning      = chart.get("warning")
+                insight      = chart.get("insight", "")
+                df_raw       = chart.get("df")
+                chart_source = chart.get("chart_source", "normal")
+
+                # 来源标签（用户指定 / AI 推荐）
+                if chart_source == "user_requested":
+                    st.markdown("**📌 你要求的图表**")
+                elif chart_source == "ai_recommended":
+                    st.markdown("**💡 AI 推荐图表**（数据更适合此类型）")
+
+                if chart_kind == "wordcloud":
+                    # 词云图：st.image 渲染 + 下载按钮
+                    png_bytes = chart.get("png_bytes")
+                    if png_bytes:
+                        st.image(png_bytes, caption=chart.get("title", ""),
+                                 use_container_width=True)
+                        st.download_button(
+                            label="⬇️ 下载词云图 (PNG)",
+                            data=png_bytes,
+                            file_name=f"{chart.get('title', 'wordcloud')}.png",
+                            mime="image/png",
+                            key=f"wc_dl_{id(msg)}_{i}",
+                        )
+                elif chart_kind == "bubble":
+                    # 气泡图：Plotly 渲染 + 象限分布 expander
+                    if fig is not None:
+                        st.plotly_chart(fig, use_container_width=True)
+                    quadrant_counts = chart.get("quadrant_counts", {})
+                    if quadrant_counts:
+                        n_total = sum(quadrant_counts.values())
+                        with st.expander("📊 象限分布统计", expanded=False):
+                            for quadrant, count in quadrant_counts.items():
+                                pct = count / n_total * 100 if n_total > 0 else 0
+                                st.write(f"**{quadrant}**: {count} 个数据点（{pct:.1f}%）")
+                else:
+                    # 普通 Plotly 图表
+                    if fig is not None:
+                        st.plotly_chart(fig, use_container_width=True)
+
+                if warning:
+                    st.warning(f"⚠️ {warning}")
+                if insight:
+                    st.info(f"📊 **图表解读**\n\n{insight}")
+                if df_raw is not None:
+                    with st.expander("📋 查看原始数据", expanded=False):
+                        st.dataframe(df_raw, use_container_width=True, hide_index=True)
+            else:
+                # 兼容 Week 2 旧格式（直接存 Figure 对象）
+                st.plotly_chart(chart, use_container_width=True)
 
 
 # ── 渲染待确认区块 ────────────────────────────────────────────────────────────
@@ -613,15 +759,68 @@ def _run_and_store_agent(user_input: str, ds: DataSource) -> None:
         return
 
     # AI 调用失败时不展示任何数据（否则会沿用上一问题的 query_results）
-    is_error = agent_result["final_answer"].startswith("⚠️")
+    # 注意：只有 run_agent 返回的系统级错误才算 is_error
+    # LLM 在正文里写的 ⚠️ 警告（如幻觉报错）不属于系统错误，不能用 startswith 判断
+    _final = agent_result["final_answer"]
+    is_error = _final.startswith("⚠️ 调用 AI 失败") or _final.startswith("⚠️ Agent 超出最大工具调用次数")
 
-    # 收集本轮 make_chart 生成的 Plotly Figure（失败时清空）
+    # 收集本轮 make_chart 生成的图表字典（含 fig / warning / insight / df）
     charts = (
         []
         if is_error
-        else [item["fig"] for item in st.session_state.get("_agent_charts", [])]
+        else list(st.session_state.get("_agent_charts", []))
     )
     st.session_state._agent_charts = []
+
+    # ── 词云兜底：用户要词云但 LLM 没生成，直接用 render_wordcloud 补生成 ──────
+    _WC_RE = re.compile(r'词云|word\s*cloud|wordcloud', re.IGNORECASE)
+    if not is_error and _WC_RE.search(user_input):
+        has_wc = any(c.get("chart_kind") == "wordcloud" for c in charts)
+        if not has_wc:
+            from chart_utils import render_wordcloud
+            query_results = st.session_state.get("query_results", {})
+            for _key, _info in reversed(list(query_results.items())):
+                _df = _info["df"]
+                if _df.empty:
+                    continue
+                _str_cols = [c for c in _df.columns if _df[c].dtype == object]
+                _num_cols = [c for c in _df.columns if pd.api.types.is_numeric_dtype(_df[c])]
+                try:
+                    if _str_cols and _num_cols:
+                        # 模式1：有词语列+频次列（category + count）
+                        _png = render_wordcloud(
+                            _df,
+                            text_col=None,
+                            word_col=_str_cols[0],
+                            freq_col=_num_cols[0],
+                            title="词云图",
+                            language="auto",
+                        )
+                    elif _str_cols:
+                        # 模式2：只有文本列（原始评论 / 文本内容）→ text_col 模式
+                        _png = render_wordcloud(
+                            _df,
+                            text_col=_str_cols[0],
+                            word_col=None,
+                            freq_col=None,
+                            title="词云图",
+                            language="auto",
+                        )
+                    else:
+                        continue
+                    charts.append({
+                        "chart_kind":   "wordcloud",
+                        "png_bytes":    _png,
+                        "title":        "词云图",
+                        "insight":      "基于高频词汇自动生成的词云图。",
+                        "df":           _df,
+                        "chart_source": "user_requested",
+                        "warning":      None,
+                    })
+                    break
+                except Exception as _e:
+                    print(f"[wordcloud fallback] error: {_e}")
+                    continue
 
     # 取本轮最新查询结果，供 DataFrame 内联展示（失败时不取，避免显示上轮数据）
     latest_df = None

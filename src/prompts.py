@@ -1,12 +1,13 @@
 """
 src/prompts.py
 ==============
-Prompt 模板：NL2SQL 系统提示词 + 动态构建函数。
+Prompt 模板：NL2SQL 系统提示词 + 动态构建函数 + 时间过滤模板库。
 
 设计考虑：
   - System prompt 固定角色和硬性约束（只 SELECT、DuckDB 语法、纯 SQL 输出）
   - User prompt 在运行时注入 schema 和用户问题，让 LLM 知道所有可用表和字段
   - 两者分离，方便单独调整和测试
+  - TIME_FILTER_TEMPLATES：diagnose_metric 工具的时间过滤标准格式，供 few-shot 参考
 """
 
 
@@ -25,8 +26,10 @@ NL2SQL_SYSTEM_PROMPT = """\
 6. 【严禁添加隐式过滤】不得根据字段名或业务含义自行推断并添加 WHERE 条件。
    - 错误示范：用户问"各分期期数的订单量"，你自行加了 WHERE payment_installments > 1
    - 错误示范：用户问销售额排名，你自行加了 WHERE order_status != 'canceled'（未经要求）
+   - 错误示范：用户问各品类平均价格评分，你自行加了 WHERE order_count >= 10 或 HAVING COUNT(*) > 5
+     （哪怕注释里写了"过滤订单量太少的品类，使图表更有意义"，也属于严禁行为）
    - 正确做法：查询所有数据，让用户自己决定是否过滤
-   - 只有用户明确说"排除 XX 值""只看已完成订单"时，才允许加对应 WHERE 条件
+   - 只有用户明确说"排除 XX 值""只看 XX 条件"时，才允许加对应 WHERE 条件
 7. 用户在问题里提供的字段值说明（例如"=0 表示异常，=1 表示全额"）是业务背景解释，
    不是过滤指令；如需体现在结果中，用 CASE WHEN 做标签列，不要用 WHERE 排除这些值。
 8. 【"X 中"≠ 过滤】用户说"分期付款中…"、"已完成订单中…"等表达，含义是"按该维度分组统计"，
@@ -65,6 +68,36 @@ FROM "orders"
 GROUP BY "order_status"
 ORDER BY "订单数" DESC
 """
+
+
+# ── 时间过滤模板库（供 diagnose_metric 工具的 filter_sql 参数参考）─────────────
+TIME_FILTER_TEMPLATES = {
+    "month_range": {
+        "description": "按月份范围过滤（含起始月、不含结束月）",
+        "template": "{date_col} >= '{start_year}-{start_month:02d}-01' AND {date_col} < '{end_year}-{end_month:02d}-01'",
+        "example": "o.order_purchase_timestamp >= '2017-10-01' AND o.order_purchase_timestamp < '2018-01-01'",
+    },
+    "quarter": {
+        "description": "按季度过滤",
+        "template": "EXTRACT(YEAR FROM {date_col}) = {year} AND EXTRACT(QUARTER FROM {date_col}) = {quarter}",
+        "example": "EXTRACT(YEAR FROM o.order_purchase_timestamp) = 2017 AND EXTRACT(QUARTER FROM o.order_purchase_timestamp) = 4",
+    },
+    "year": {
+        "description": "按整年过滤",
+        "template": "EXTRACT(YEAR FROM {date_col}) = {year}",
+        "example": "EXTRACT(YEAR FROM o.order_purchase_timestamp) = 2017",
+    },
+    "last_n_days": {
+        "description": "最近 N 天（动态，相对当前日期）",
+        "template": "{date_col} >= CURRENT_DATE - INTERVAL '{n}' DAY",
+        "example": "o.order_purchase_timestamp >= CURRENT_DATE - INTERVAL '30' DAY",
+    },
+    "custom": {
+        "description": "自定义日期范围（含两端）",
+        "template": "{date_col} BETWEEN '{start_date}' AND '{end_date}'",
+        "example": "o.order_purchase_timestamp BETWEEN '2017-10-01' AND '2017-12-31'",
+    },
+}
 
 
 def build_nl2sql_prompt(user_question: str, schema_text: str) -> str:
