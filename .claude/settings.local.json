@@ -16,7 +16,20 @@
       "Bash(.venv/Scripts/python -c ' *)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('src/agent.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
       "Bash(.venv/Scripts/python.exe -c \"import wordcloud; print\\('wordcloud version:', wordcloud.__version__\\)\")",
-      "Bash(.venv/Scripts/python.exe -c ' *)"
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(D:/Anaconda3/python.exe -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(D:/Anaconda3/python.exe -c \"import docx; print\\('docx OK'\\)\")",
+      "Bash(D:/Anaconda3/python.exe -c \"import markdown; print\\('markdown OK'\\)\")",
+      "Bash(D:/Anaconda3/python.exe -c \"import kaleido; print\\('kaleido OK'\\)\")",
+      "Bash(D:/Anaconda3/python.exe -m pip install python-docx kaleido)",
+      "Bash(D:/Anaconda3/python.exe -m pip install \"kaleido==0.2.1\")",
+      "Bash(timeout 30)",
+      "Bash(D:/Anaconda3/python.exe -c \"import kaleido; print\\(kaleido.__version__\\)\")",
+      "Bash(D:/Anaconda3/python.exe -c \"import plotly; print\\(plotly.__version__\\)\")",
+      "Bash(D:/Anaconda3/python.exe -c ' *)",
+      "Bash(D:/Anaconda3/python.exe -m pip install xhtml2pdf)",
+      "Bash(streamlit run *)",
+      "mcp__Claude_in_Chrome__tabs_context_mcp"
     ]
   }
 }

@@ -25,6 +25,7 @@ from openai import OpenAI
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, MODEL_NAME
 import chart_utils
+import report_builder
 from validators import validate_chart_type, validate_diagnose_params, validate_wordcloud_input
 
 # 统一色板（Seaborn "deep" 系列，适合商业报表）
@@ -468,6 +469,68 @@ TOOLS_SCHEMA = [
                     "metric_name", "base_sql", "date_column",
                     "period_a", "period_b", "drill_dimensions",
                 ],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_report",
+            "description": (
+                "把当前会话的所有分析整合成完整报告。\n"
+                "支持三种格式：\n"
+                "- markdown: 在页面内展示\n"
+                "- word: 下载 .docx（含格式，适合编辑）\n"
+                "- pdf: 下载 .pdf（含图表截图，适合发送/存档）\n"
+                "- all: 同时提供 Word 和 PDF 两个下载按钮（默认推荐）\n"
+                "建议默认用 all，让用户自行选择。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "report_title": {
+                        "type": "string",
+                        "description": "报告标题，如'2017年Q4销售分析周报'",
+                    },
+                    "include_sections": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["背景", "核心发现", "详细分析", "归因结论", "建议", "附录"],
+                        },
+                        "description": "要包含的章节列表",
+                    },
+                    "audience": {
+                        "type": "string",
+                        "enum": ["management", "operation", "technical"],
+                        "description": (
+                            "management: 管理层，结论优先，无技术细节 / "
+                            "operation: 运营，可执行建议优先 / "
+                            "technical: 技术，完整方法论"
+                        ),
+                    },
+                    "output_format": {
+                        "type": "string",
+                        "enum": ["markdown", "word", "pdf", "all"],
+                        "description": (
+                            "输出格式：\n"
+                            "- markdown: 只在页面展示，不下载\n"
+                            "- word: 只下载 .docx\n"
+                            "- pdf: 只下载 .pdf（含图表截图）\n"
+                            "- all: 页面展示 + Word 下载 + PDF 下载（默认推荐）"
+                        ),
+                    },
+                    "embed_charts": {
+                        "type": "boolean",
+                        "description": (
+                            "PDF 中是否嵌入图表截图。"
+                            "true=嵌入（文件较大，内容完整，首次可能较慢）；"
+                            "false=只有文字和表格（文件小，生成快）。**默认 false**，"
+                            "用户明确要求含图才设 true。"
+                        ),
+                    },
+                },
+                "required": ["report_title", "include_sections"],
             },
         },
     },
@@ -1059,6 +1122,16 @@ def make_chart(
             chart_entry["quadrant_counts"]  = _bubble_quadrant_counts
         st.session_state._agent_charts.append(chart_entry)
 
+        # ── chart_registry：供 generate_report 收集本轮所有图表 ────────────────
+        if "chart_registry" not in st.session_state:
+            st.session_state["chart_registry"] = []
+        if fig is not None:
+            st.session_state["chart_registry"].append({
+                "fig":       fig,
+                "caption":   title,
+                "timestamp": datetime.now().isoformat(),
+            })
+
         y_desc = ",".join(y_cols) if is_multi else y_col
         return (
             f"图表已生成: {title}"
@@ -1068,6 +1141,257 @@ def make_chart(
 
     except Exception as e:
         return f"图表生成失败: {e}"
+
+
+def generate_report(
+    report_title: str,
+    include_sections: list,
+    audience: str = "operation",
+    output_format: str = "all",
+    embed_charts: bool = False,
+) -> str:
+    """
+    把本轮所有分析整合成完整报告（Markdown 展示 + Word/PDF 下载按钮）。
+
+    Step 1: 从 session_state 收集分析内容（对话历史 + 查询结果摘要）
+    Step 2: 调用 LLM 生成 Markdown 格式报告内容
+    Step 3: 根据 output_format 生成对应输出（存入 session_state['_report_output']）
+    """
+    import concurrent.futures as _cf
+
+    # ── Step 1: 收集本轮分析内容 ────────────────────────────────────────────────
+    messages      = st.session_state.get("messages", [])
+    query_results = st.session_state.get("query_results", {})
+
+    # 取 assistant 的文字回答，每条限 800 字，最多 8 条
+    conversation_summary = []
+    for msg in messages:
+        if msg.get("role") == "assistant" and msg.get("content"):
+            txt = msg["content"]
+            if len(txt) > 800:
+                txt = txt[:800] + "…"
+            conversation_summary.append(txt)
+    conversation_summary = conversation_summary[-8:]
+
+    def _detect_preview_rows(info: dict, default: int = 30) -> int:
+        """
+        从 SQL LIMIT 子句或 intent 文本推断用户期望看到的行数。
+        优先级：SQL LIMIT > intent 文本中的 Top/前N > default。
+        上限 200 行，防止 prompt 过大。
+        """
+        # 1. SQL LIMIT 子句（最可靠）
+        sql = info.get("sql", "")
+        m = re.search(r'\bLIMIT\s+(\d+)', sql, re.IGNORECASE)
+        if m:
+            return min(int(m.group(1)), 200)
+        # 2. intent 文本：支持 "Top50" / "top 50" / "前50" / "前50名" / "排名前50"
+        intent_txt = info.get("intent", "")
+        m = re.search(r'(?:top|前|排名前)\s*(\d+)', intent_txt, re.IGNORECASE)
+        if m:
+            return min(int(m.group(1)), 200)
+        return default
+
+    # 查询结果摘要：最多 6 个，行数动态适配（Top N 用 N 行，否则默认 30 行）
+    # 同时附加数值列统计，避免 LLM 自行推算聚合指标
+    data_summaries = []
+    for _intent_key, info in list(query_results.items())[:6]:
+        df = info["df"]
+        if df.empty:
+            continue
+        n_rows = _detect_preview_rows(info)
+        preview = df.head(n_rows).to_string(index=False)
+        numeric_cols = df.select_dtypes(include="number").columns.tolist()
+        stats_str = ""
+        if numeric_cols and len(df) > 1:
+            stats = df[numeric_cols].agg(["sum", "mean", "min", "max"]).round(4)
+            stats_str = f"\n【数值统计（sum/mean/min/max）】\n{stats.to_string()}"
+        data_summaries.append(
+            f"【{info['intent']}】共 {info['row_count']} 行（报告展示前 {n_rows} 行），"
+            f"列：{', '.join(info['columns'])}\n"
+            f"{preview}{stats_str}"
+        )
+
+    # ── Step 2a: fallback 编译模式（纯 Python，瞬间完成）──────────────────────
+    def _compile_report() -> str:
+        """从现有对话直接编译报告，不调 LLM，几乎瞬间完成。"""
+        sections_list = include_sections or ["背景", "核心发现", "详细分析", "建议"]
+        lines = [f"# {report_title}", ""]
+
+        section_map = {
+            "背景": (
+                "## 一、背景\n"
+                f"本报告基于本次对话中的 {len(query_results)} 次数据查询，"
+                f"涵盖 {len(conversation_summary)} 轮分析，整理关键发现与建议。"
+            ),
+            "核心发现": (
+                "## 二、核心发现\n" +
+                "\n\n".join(f"### 发现 {i+1}\n{s}" for i, s in enumerate(conversation_summary[:3]))
+            ),
+            "详细分析": (
+                "## 三、详细分析\n" +
+                ("\n\n".join(conversation_summary) if conversation_summary else "（暂无详细分析内容）") +
+                ("\n\n### 数据摘要\n" + "\n\n".join(data_summaries) if data_summaries else "")
+            ),
+            "归因结论": (
+                "## 归因结论\n" +
+                "\n\n".join(s for s in conversation_summary if "归因" in s or "原因" in s or "贡献" in s)
+                or "（本次分析暂无归因结论）"
+            ),
+            "建议": (
+                "## 四、建议\n" +
+                "\n\n".join(s for s in conversation_summary if "建议" in s or "推荐" in s or "方向" in s)
+                or "（请参考上方分析内容中的方向建议）"
+            ),
+            "附录": (
+                "## 五、附录\n### 查询数据摘要\n" +
+                ("\n\n".join(data_summaries) if data_summaries else "（暂无查询数据）")
+            ),
+        }
+        for sec in sections_list:
+            lines.append(section_map.get(sec, f"## {sec}\n（暂无内容）"))
+            lines.append("")
+        return "\n".join(lines)
+
+    # ── Step 2b: LLM 增强模式（90s 超时，超时自动 fallback）──────────────────
+    def _llm_report() -> str:
+        audience_desc = {
+            "management": "管理层（简洁、结论优先、聚焦业务影响和决策）",
+            "operation":  "运营人员（可执行建议优先、包含数据细节）",
+            "technical":  "技术人员（完整方法论）",
+        }.get(audience, "运营人员")
+        sections_str = "、".join(include_sections) if include_sections else "核心发现、详细分析、建议"
+        data_block = (
+            "\n\n=== 原始查询数据（报告所有数字必须严格来自此处，禁止自行推算）===\n"
+            + "\n\n---\n".join(data_summaries)
+        ) if data_summaries else ""
+        prompt = (
+            f"请用 Markdown 格式（# 一级标题 ## 二级标题）撰写一份面向【{audience_desc}】的分析报告。\n"
+            f"报告标题：{report_title}\n章节要求：{sections_str}\n\n"
+            "⚠️ 数据保真规则（最高优先级）：\n"
+            "1. 报告中出现的每一个数字必须与下方「原始查询数据」完全一致，不得四舍五入到不同精度；\n"
+            "2. 禁止对已有列进行二次计算（如用 A/B 推算新指标），如果所需指标列已存在则直接引用；\n"
+            "3. 如果某个指标在数据中不存在，请在报告中注明「(数据中无此项)」，不得推断或估算；\n"
+            "4. 表格中每一个单元格的数字都必须能在下方数据中找到原始依据。\n\n"
+            f"=== 本轮分析对话摘要 ===\n" + "\n\n".join(conversation_summary) +
+            data_block +
+            "\n\n其他要求：语言专业简洁，关键结论加粗，表格使用 Markdown 格式，建议部分具体可执行。"
+        )
+        client = OpenAI(
+            api_key=DEEPSEEK_API_KEY,
+            base_url=DEEPSEEK_BASE_URL,
+            timeout=85.0,
+        )
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是专业数据分析报告撰写专家。"
+                        "你的核心原则是数据保真：报告中的每一个数字都必须与用户提供的原始查询数据完全一致，"
+                        "绝对不允许自行推算、估算或编造任何数字。"
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=3000,
+        )
+        return resp.choices[0].message.content.strip()
+
+    def _run_with_timeout(fn, timeout_sec):
+        """
+        在独立线程执行 fn()，最多等待 timeout_sec 秒。
+        超时后立即返回 None 并以 wait=False 释放线程（不阻塞主线程）。
+        注意：不能用 `with ThreadPoolExecutor` —— 其 __exit__ 调用 shutdown(wait=True)，
+        会一直等线程结束，导致界面卡死。
+        """
+        _ex = _cf.ThreadPoolExecutor(max_workers=1)
+        _f  = _ex.submit(fn)
+        try:
+            return _f.result(timeout=timeout_sec)
+        except (_cf.TimeoutError, Exception):
+            return None
+        finally:
+            _ex.shutdown(wait=False)   # 立即释放，不等后台线程
+
+    # 先尝试 LLM（90s），超时或失败则 fallback 编译
+    content  = _run_with_timeout(_llm_report, 90)
+    used_llm = bool(content)
+    if not content:
+        content = _compile_report()
+
+    # ── Step 3: 根据 output_format 生成输出，存入 session_state ─────────────────
+    # 支持 "all" / "markdown" / "word" / "pdf" / "word+pdf" 等复合格式
+    if output_format == "all":
+        _fmts = {"markdown", "word", "pdf"}
+    else:
+        _fmts = set(output_format.replace(",", "+").split("+"))
+
+    figures  = []
+    captions = []
+    if embed_charts:
+        chart_reg = st.session_state.get("chart_registry", [])
+        figures  = [item["fig"]     for item in chart_reg if item.get("fig") is not None]
+        captions = [item["caption"] for item in chart_reg if item.get("fig") is not None]
+
+    report_output = {
+        "title":         report_title,
+        "content":       content,
+        "output_format": output_format,
+        "figures":       figures,
+        "captions":      captions,
+    }
+
+    # Word 生成（30s 超时）
+    if "word" in _fmts:
+        def _make_word():
+            return report_builder.markdown_to_word(content, report_title)
+        result = _run_with_timeout(_make_word, 30)
+        if result is not None:
+            report_output["word_bytes"] = result
+        else:
+            report_output["word_error"] = "Word 生成超时（>30s），请重试"
+
+    # PDF 生成（60s 超时）
+    if "pdf" in _fmts:
+        def _make_pdf():
+            return report_builder.markdown_to_pdf(content, report_title, figures, captions)
+        try:
+            result = _run_with_timeout(_make_pdf, 60)
+            if result is not None:
+                report_output["pdf_bytes"] = result
+            else:
+                report_output["pdf_error"] = "PDF 生成超时（>60s），建议改用 Word 格式"
+        except Exception as e:
+            report_output["pdf_error"] = f"PDF 生成失败: {e}"
+
+    # 存入 session_state 供 app.py 渲染
+    if "_report_output" not in st.session_state:
+        st.session_state["_report_output"] = []
+    st.session_state["_report_output"].append(report_output)
+
+    # 返回给 LLM 的摘要（告知报告已就绪，禁止 LLM 再重复输出报告全文）
+    word_ok = "word_bytes" in report_output
+    pdf_ok  = "pdf_bytes"  in report_output
+    mode_note = "AI 润色版" if used_llm else "快速编译版（LLM 超时已自动降级）"
+    status_parts = []
+    if "markdown" in _fmts:
+        status_parts.append(f"Markdown 已生成（{mode_note}）")
+    if "word" in _fmts:
+        status_parts.append("Word ✅ 已生成" if word_ok
+                            else f"Word ❌ 生成失败: {report_output.get('word_error', '未知错误')}")
+    if "pdf" in _fmts:
+        status_parts.append("PDF ✅ 已生成" if pdf_ok
+                            else f"PDF ❌ 生成失败: {report_output.get('pdf_error', '未知错误')}")
+
+    # ⚠️ 这里刻意不返回报告全文，避免 LLM 把内容重复渲染一遍
+    return (
+        f"[工具执行完毕] 报告《{report_title}》已生成并展示在界面下方。\n"
+        f"生成状态：{'、'.join(status_parts)}\n"
+        "请用一两句话告知用户报告已就绪、可在界面下方查看和下载，"
+        "不要重复输出报告正文内容。"
+    )
 
 
 def analyze_dataframe(analysis_type: str, result_key: str = None) -> str:
@@ -1515,6 +1839,14 @@ def execute_tool(name: str, args: dict, ds, user_wants_wordcloud: bool = False) 
             decomposition_formula=args.get("decomposition_formula"),
             ds=ds,
         )
+    elif name == "generate_report":
+        return generate_report(
+            report_title=args.get("report_title", "分析报告"),
+            include_sections=args.get("include_sections", ["核心发现", "详细分析", "建议"]),
+            audience=args.get("audience", "operation"),
+            output_format=args.get("output_format", "all"),
+            embed_charts=args.get("embed_charts", True),
+        )
     else:
-        known = "query_database, make_chart, analyze_dataframe, diagnose_metric"
+        known = "query_database, make_chart, analyze_dataframe, diagnose_metric, generate_report"
         return f"未知工具: {name}，可用工具: {known}"

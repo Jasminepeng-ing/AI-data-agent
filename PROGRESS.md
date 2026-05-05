@@ -1,5 +1,67 @@
 # AI 数据分析 Agent · 开发进度
 
+## 今日完成（2026-05-05）
+
+### Week 3 · Day 22（下）：主动洞察 + 报告生成系统
+
+手册对应：`AI数据分析Agent_完整开发手册_v2.md` **第 1742–2140 行**
+
+#### 新建文件
+
+**`src/report_builder.py`**
+
+纯 Python 报告构建模块（不依赖 Streamlit）：
+
+| 函数 | 作用 |
+|---|---|
+| `markdown_to_word(content, title)` | Markdown → 格式化 Word (.docx)：标题/正文/加粗/表格/项目符号/水平线，含页眉页脚页码 |
+| `export_chart_as_png(fig, w, h)` | Plotly Figure → PNG bytes（kaleido）；找不到 kaleido 返回 None，不阻断 |
+| `build_html_report(content, title, figs, captions)` | Markdown + 图表截图 → 完整 HTML 字符串（A4 CSS，含中文字体、表格、代码块样式）|
+| `html_to_pdf(html)` | HTML → PDF bytes（weasyprint）；找不到 weasyprint 抛 ImportError 给调用方 |
+| `markdown_to_pdf(content, title, figs, captions)` | 对外唯一 PDF 入口，依次调 build_html_report + html_to_pdf |
+
+#### 修改文件
+
+**`src/agent.py`**
+
+- 工具列表新增第 5 项 `generate_report`
+- `AGENT_SYSTEM_PROMPT` 新增【主动洞察】章节：每轮分析结束后强制推荐 3 个下钻方向，固定格式 `[1]/[2]/[3]`，优先推荐异常点和有业务价值的方向，不重复上一轮已分析的维度
+
+**`src/tools.py`**
+
+- `import report_builder`
+- `TOOLS_SCHEMA` 新增 `generate_report` 工具（Schema）：支持 markdown/word/pdf/all 四种格式，audience（management/operation/technical），embed_charts 开关
+- `make_chart` section 6 之后新增 `chart_registry` 注册：每次成功生成 Plotly 图表后把 `{fig, caption, timestamp}` 存入 `session_state['chart_registry']`，供 `generate_report` 收集截图
+- 新增 `generate_report()` 函数：6 步流程（收集对话历史 + 查询摘要 → LLM 生成 Markdown → Word 生成 → PDF 生成 → 存入 `_report_output` → 返回状态摘要给 LLM）
+- `execute_tool()` 新增 `generate_report` 路由
+
+**`src/app.py`**
+
+- `init_session_state()` 新增 `chart_registry = []` 和 `_report_output = []`
+- 清空对话按钮同步清空 `chart_registry` 和 `_report_output`
+- `_run_and_store_agent()` 每轮开始前清空 `_report_output`，结束时收集后存入 message 的 `report_outputs` 字段
+- 新增 `_render_report_output(rpt)` 函数：渲染 Markdown（expander）+ Word 下载按钮 + PDF 下载按钮（失败时显示安装提示）
+- `_render_message()` 图表渲染循环之后调用 `_render_report_output`
+
+#### 新增依赖
+
+```
+pip install python-docx markdown kaleido
+```
+
+weasyprint（PDF）为可选依赖，Windows 需额外安装 GTK 运行时；未装时 UI 显示友好提示而非崩溃。
+
+#### 用户说"PDF 未安装 weasyprint"时的提示
+
+界面上会显示黄色警告框：
+> ⚠️ PDF 生成需要 weasyprint。安装方法：`pip install weasyprint`
+> Windows 用户还需安装 GTK 运行时，详见 weasyprint 官方文档。
+> 可以使用 Word 格式作为替代。
+
+Word 下载按钮仍然可用（python-docx 不依赖 GTK）。
+
+---
+
 ## 今日完成（2026-05-04）
 
 ### Week 3 · Day 21：归因诊断工具接入 Agent（Day 21 手册任务）
@@ -305,25 +367,26 @@ pip install wordcloud matplotlib
 
 ## 当前停在
 
-**Week 3 · Day 22 完成（2026-05-04）**
+**Week 3 · Day 22 全部完成（2026-05-05）— Week 3 已收官**
 
 当前 Agent 具备的能力：
 - **防幻觉**：`query_database` ≤100 行全量传给 LLM
 - **SQL 防护**：12 条规则（Fan-out、NULL 品类、同比/环比、跨年边界、禁止自加数量阈值过滤等）
 - **多步规划**：先输出分析计划，逐步调用工具
 - **多轮记忆**：`_trim_messages` 确保不超 token 限制
-- **智能图表**：11 种图表类型（新增 bubble）+ 自动校验降级 + insight + 原始数据 expander
+- **智能图表**：12 种图表类型 + 自动校验降级 + insight + 原始数据 expander
 - **多系列图表**：bar/barh/line 支持 y_cols（宽格式）和 color_col（长格式）
-- **词云图**：wordcloud，支持已聚合（word_col+freq_col）和原始文本（text_col）两种模式
+- **词云图**：wordcloud，支持已聚合和原始文本两种模式
 - **气泡图**：bubble，中位数参考线 + 四象限统计 + 双轴 k/M/G 格式化
-- **归因诊断**：`diagnose_metric` 全链路（Day 18-21 已完成）：
-  - SQL 拼接 + 贡献度计算 + 置信度评估 + LLM 结论生成
-  - System Prompt 接入：触发规则 + 调用前确认清单 + 输出格式 5 项要求
+- **归因诊断**：`diagnose_metric` 全链路（SQL 拼接 + 贡献度计算 + 置信度评估 + LLM 结论）
+- **主动洞察**：每轮分析后自动推荐 3 个下钻方向，引用具体数字，不重复已分析维度
+- **报告生成**：`generate_report` 工具，支持 Markdown 展示 + Word 下载 + PDF 下载（含图表截图）
 
-下次工作建议：
-1. **app.py 渲染 diagnose_metric 结果**：在 `_render_message()` 中解析 `_diagnose_results`，用 Plotly 瀑布图可视化贡献度
-2. **图表交互优化**：下钻、筛选、导出 PNG/CSV
+下次工作建议（Week 4 方向）：
+1. **归因诊断可视化**：用 Plotly 瀑布图渲染 `_diagnose_results` 贡献度
+2. **图表交互优化**：下钻筛选、导出 PNG/CSV
 3. **多数据源支持**：用户上传 CSV/Excel 后可直接查询
+4. **weasyprint 安装测试**：验证 PDF 完整管线（含图表截图嵌入）
 
 ---
 

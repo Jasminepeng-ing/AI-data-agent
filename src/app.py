@@ -151,6 +151,13 @@ def init_session_state() -> None:
     if "_agent_charts" not in st.session_state:
         st.session_state._agent_charts = []
 
+    # Week 3 新增：图表注册表（供 generate_report 使用）+ 报告输出暂存
+    if "chart_registry" not in st.session_state:
+        st.session_state["chart_registry"] = []
+
+    if "_report_output" not in st.session_state:
+        st.session_state["_report_output"] = []
+
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 def render_sidebar(ds: DataSource) -> None:
@@ -174,6 +181,8 @@ def render_sidebar(ds: DataSource) -> None:
             st.session_state.latest_query_key = None
             st.session_state._agent_charts = []
             st.session_state.pending = None
+            st.session_state["chart_registry"] = []
+            st.session_state["_report_output"] = []
             st.rerun()
 
         st.divider()
@@ -472,8 +481,130 @@ def _render_dataframe_with_total(df: pd.DataFrame) -> None:
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
+# ── 报告输出渲染 ─────────────────────────────────────────────────────────────
+def _render_report_output(rpt: dict) -> None:
+    """
+    渲染 generate_report 工具产生的报告输出：
+    - Markdown 内联展示
+    - Word 下载按钮（.docx）
+    - PDF 下载按钮（.pdf），失败时显示安装提示
+    """
+    title         = rpt.get("title", "分析报告")
+    content       = rpt.get("content", "")
+    output_format = rpt.get("output_format", "all")
+
+    st.divider()
+    st.markdown(f"### 📄 报告：{title}")
+
+    # Markdown 内联展示
+    if output_format in ("markdown", "all"):
+        with st.expander("📝 查看报告内容", expanded=True):
+            st.markdown(content)
+
+    # 下载按钮行
+    col_word, col_pdf, _ = st.columns([1.5, 1.5, 4])
+
+    # Word 下载
+    if output_format in ("word", "all"):
+        word_bytes = rpt.get("word_bytes")
+        word_error = rpt.get("word_error")
+        with col_word:
+            if word_bytes:
+                st.download_button(
+                    label="📄 下载 Word 报告",
+                    data=word_bytes,
+                    file_name=f"{title}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key=f"dl_word_{id(rpt)}",
+                )
+            elif word_error:
+                st.error(f"Word 生成失败：{word_error}")
+
+    # PDF 下载
+    if output_format in ("pdf", "all"):
+        pdf_bytes = rpt.get("pdf_bytes")
+        pdf_error = rpt.get("pdf_error")
+        with col_pdf:
+            if pdf_bytes:
+                st.download_button(
+                    label="📑 下载 PDF 报告",
+                    data=pdf_bytes,
+                    file_name=f"{title}.pdf",
+                    mime="application/pdf",
+                    key=f"dl_pdf_{id(rpt)}",
+                )
+            elif pdf_error:
+                st.error(f"PDF 生成失败：{pdf_error}")
+
+
+# ── 快捷报告生成按钮 ──────────────────────────────────────────────────────────
+def _render_report_button(msg: dict, msg_idx: int) -> None:
+    """
+    在有分析结果的 assistant 消息末尾渲染「生成分析报告」快捷区域。
+    用户选择格式后点击确认，直接调用 generate_report 并将结果挂到该消息。
+    """
+    # 只对有工具调用、且尚未生成过报告的消息显示
+    if not msg.get("tool_calls_log"):
+        return
+    if msg.get("report_outputs"):
+        return
+
+    kp = f"rptbtn_{msg_idx}"   # key prefix，保证每条消息唯一
+
+    st.divider()
+    with st.expander("📊 生成本次分析报告", expanded=False):
+        st.caption("选择需要的报告格式，点击「确认生成」即可下载")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            sel_md   = st.checkbox("📝 Markdown", value=True, key=f"{kp}_md")
+        with c2:
+            sel_word = st.checkbox("📄 Word",     value=True, key=f"{kp}_word")
+        with c3:
+            sel_pdf  = st.checkbox("📑 PDF",      value=True, key=f"{kp}_pdf")
+
+        if st.button("✅ 确认生成", key=f"{kp}_confirm", type="primary"):
+            # 收集选中格式
+            fmts = []
+            if sel_md:   fmts.append("markdown")
+            if sel_word: fmts.append("word")
+            if sel_pdf:  fmts.append("pdf")
+            if not fmts:
+                st.warning("请至少选择一种格式")
+                return
+
+            output_format = "all" if len(fmts) == 3 else "+".join(fmts)
+
+            # 从该消息之前的对话中提取用户问题作为报告标题
+            all_msgs = st.session_state.get("messages", [])
+            user_q = ""
+            for m in reversed(all_msgs[:msg_idx + 1]):
+                if m.get("role") == "user" and m.get("content"):
+                    user_q = m["content"][:50].strip().rstrip("。？?！!，,")
+                    break
+            report_title = f"{user_q}分析报告" if user_q else "本次分析报告"
+
+            # 清空暂存区，调用 generate_report
+            st.session_state["_report_output"] = []
+            from tools import generate_report as _gen
+            with st.spinner("正在生成报告，请稍候…"):
+                _gen(
+                    report_title=report_title,
+                    include_sections=["背景", "核心发现", "详细分析", "建议", "附录"],
+                    audience="operation",
+                    output_format=output_format,
+                    embed_charts=False,
+                )
+
+            # 把结果挂到本条消息
+            rpts = list(st.session_state.get("_report_output", []))
+            if rpts:
+                st.session_state["messages"][msg_idx]["report_outputs"] = rpts
+                st.session_state["_report_output"] = []
+            st.rerun()
+
+
 # ── 渲染单条历史消息 ───────────────────────────────────────────────────────────
-def _render_message(msg: dict) -> None:
+def _render_message(msg: dict, msg_idx: int = -1) -> None:
     """
     渲染一条历史消息。
 
@@ -574,6 +705,14 @@ def _render_message(msg: dict) -> None:
             else:
                 # 兼容 Week 2 旧格式（直接存 Figure 对象）
                 st.plotly_chart(chart, use_container_width=True)
+
+        # ── 报告输出（generate_report 工具生成）────────────────────────────────
+        for rpt in msg.get("report_outputs") or []:
+            _render_report_output(rpt)
+
+        # ── 快捷报告按钮（仅 assistant 消息）───────────────────────────────
+        if msg["role"] == "assistant" and msg_idx >= 0:
+            _render_report_button(msg, msg_idx)
 
 
 # ── 渲染待确认区块 ────────────────────────────────────────────────────────────
@@ -692,8 +831,8 @@ def render_chat(ds: DataSource) -> None:
     st.divider()
 
     # 1. 渲染历史消息
-    for msg in st.session_state.messages:
-        _render_message(msg)
+    for _msg_idx, msg in enumerate(st.session_state.messages):
+        _render_message(msg, _msg_idx)
 
     # 2. 渲染待确认区块（仅大查询时触发）
     if st.session_state.pending:
@@ -727,8 +866,9 @@ def _run_and_store_agent(user_input: str, ds: DataSource) -> None:
 
     独立抽取为函数是为了让 render_chat 和历史回放都能复用同一套逻辑。
     """
-    # 清空本轮图表暂存区
+    # 清空本轮图表暂存区和报告暂存区
     st.session_state._agent_charts = []
+    st.session_state["_report_output"] = []
 
     # 取历史（不含本轮 user 消息）
     history = st.session_state.messages[:-1]
@@ -771,6 +911,14 @@ def _run_and_store_agent(user_input: str, ds: DataSource) -> None:
         else list(st.session_state.get("_agent_charts", []))
     )
     st.session_state._agent_charts = []
+
+    # 收集本轮 generate_report 生成的报告输出
+    report_outputs = (
+        []
+        if is_error
+        else list(st.session_state.get("_report_output", []))
+    )
+    st.session_state["_report_output"] = []
 
     # ── 词云兜底：用户要词云但 LLM 没生成，直接用 render_wordcloud 补生成 ──────
     _WC_RE = re.compile(r'词云|word\s*cloud|wordcloud', re.IGNORECASE)
@@ -847,6 +995,7 @@ def _run_and_store_agent(user_input: str, ds: DataSource) -> None:
         "tool_calls_log": agent_result["tool_calls_log"],
         "dataframe":      latest_df,
         "charts":         charts,
+        "report_outputs": report_outputs,
     })
 
 
