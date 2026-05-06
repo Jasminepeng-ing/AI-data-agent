@@ -1063,7 +1063,7 @@ def markdown_to_pdf(
         story.append(Paragraph("附图", s_h1))
         story.append(HRFlowable(width="100%", thickness=0.5, color=C_BLUE, spaceAfter=4 * pt))
         for _c in _unplaced:
-            _png = export_chart_as_png(_c['fig'])
+            _png = _c.get('png') or export_chart_as_png(_c['fig'])
             if _png is not None:
                 from reportlab.platypus import Image as _RLImage
                 story.append(_RLImage(BytesIO(_png), width=avail_w, height=avail_w * 500 / 1100))

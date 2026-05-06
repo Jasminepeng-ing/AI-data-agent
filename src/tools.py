@@ -1353,16 +1353,31 @@ def generate_report(
         else:
             report_output["word_error"] = "Word 生成超时（>30s），请重试"
 
-    # PDF 生成（60s 超时）
+    # PDF 生成（120s 超时）
+    # 先并行预导出所有图表 PNG（每张最多 25s，并行执行），再传给 markdown_to_pdf
+    # 避免串行导出 N 张图累计超时：3 张 × 25s = 75s > 旧上限 60s
     if "pdf" in _fmts:
+        _png_bytes_list: list = []
+        if figures:
+            with _cf.ThreadPoolExecutor(max_workers=min(len(figures), 4)) as _pool:
+                _futures = [_pool.submit(report_builder.export_chart_as_png, fig) for fig in figures]
+                for _fut in _futures:
+                    try:
+                        _png_bytes_list.append(_fut.result(timeout=28))
+                    except Exception:
+                        _png_bytes_list.append(None)
+
         def _make_pdf():
-            return report_builder.markdown_to_pdf(content, report_title, figures, captions)
+            return report_builder.markdown_to_pdf(
+                content, report_title, figures, captions,
+                chart_png_bytes=_png_bytes_list or None,
+            )
         try:
-            result = _run_with_timeout(_make_pdf, 60)
+            result = _run_with_timeout(_make_pdf, 120)
             if result is not None:
                 report_output["pdf_bytes"] = result
             else:
-                report_output["pdf_error"] = "PDF 生成超时（>60s），建议改用 Word 格式"
+                report_output["pdf_error"] = "PDF 生成超时（>120s），建议改用 Word 格式"
         except Exception as e:
             report_output["pdf_error"] = f"PDF 生成失败: {e}"
 

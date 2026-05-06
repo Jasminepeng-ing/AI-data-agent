@@ -1,5 +1,108 @@
 # AI 数据分析 Agent · 开发进度
 
+## 今日完成（2026-05-06）
+
+### PDF 报告专项优化（PDF报告优化.md 全部任务完成）
+
+来源：`PDF报告优化.md` 四项任务，解决"PDF 样式丑陋"和"图表未嵌入报告"两大问题。
+
+---
+
+#### 任务一：重新设计 CSS（`src/report_builder.py`）
+
+新建模块级常量 `_HTML_REPORT_CSS`，替换原有内联 `<style>`：
+
+| 设计规范 | 值 |
+|---|---|
+| 主色调（深海蓝） | `#1B3A6B` |
+| 强调色（橙色） | `#E87722` |
+| 正文颜色 | `#2C2C2C` |
+| 字体优先级 | Microsoft YaHei → PingFang SC → STHeiti → WenQuanYi → sans-serif |
+
+CSS 覆盖范围：`@page` A4 规格 + 页眉/页脚、封面（`.cover`/`.cover-tag`/`.cover-title`/`.cover-meta`）、h1/h2/h3 标题层级、表格（深海蓝表头 + 斑马纹行）、图表容器（`.chart-container`/`.chart-caption`）、洞察框/建议框、水印、附录区域。
+
+---
+
+#### 任务二：重构 `build_html_report`（`src/report_builder.py`）
+
+完整重写，核心改动：
+
+**封面与页眉**：
+- HTML 结构新增 `<div id="page-header">`（weasyprint running element，每页显示标题 + 日期）
+- 封面区块包含 `cover-tag`（橙色 "Analysis Report" 标签）、标题、副标题、元信息
+
+**图表按章节匹配嵌入**（不再统一放末尾）：
+- `_match_chart_for_section(section_title, unplaced)` 新增辅助函数
+  - 优先级 1：图表标题包含章节关键词（字符串包含，忽略大小写）
+  - 优先级 2：**中文 bigram 关键词交集**：`re.findall(r'[一-鿿]+', s)` 提取中文字符串，滑动窗口生成 2 字元组，取章节与图表的交集
+  - 优先级 3：无匹配 → 图表进附录
+- `_chart_html(n, b64, caption)` 生成标准图表 HTML 片段
+- 解析 Markdown → HTML 后，用 `re.split(r'(<h2>.*?</h2>)', body_html)` 按 `<h2>` 分割为多段，逐段查找并插入匹配图表
+- 未被匹配的图表统一追加到 `<div class="appendix">` 附录区域
+
+**Bigram 匹配验证**（单元测试）：
+```
+sections = ["地理分布", "品类偏好", "支付方式"]
+captions = ["各州订单量对比", "Top品类销售额", "支付方式占比"]
+→ 地理分布 ← 各州订单量对比（优先级2，bigram 无交集 → 优先级1 fallback）
+→ 品类偏好 ← Top品类销售额（"品类" bigram 交集匹配）
+→ 支付方式 ← 支付方式占比（"支付方式" bigram 交集匹配）
+```
+
+---
+
+#### 任务三：更新 `generate_report`（`src/tools.py`）
+
+- 始终从 `chart_registry` 读取图表（移除旧 `embed_charts` 开关限制）：
+  ```python
+  chart_reg = st.session_state.get("chart_registry", [])
+  valid_charts = [item for item in chart_reg if item.get("fig") is not None]
+  ```
+- PDF 下载按钮旁新增说明：`st.caption(f"📊 本 PDF 包含本轮 {chart_count} 张图表截图")`
+- 修复 `_render_report_output`：复合格式（`"word+pdf"`）改为 set 解析，不再用精确字符串匹配
+
+---
+
+#### 任务四：提升 `export_chart_as_png` 分辨率（`src/report_builder.py`）
+
+- 默认参数更新：`width=1100, height=500, scale=2`
+- 实际导出像素：**2200 × 1000**，满足 A4 高清打印
+
+---
+
+#### 同步优化：PDF 样式与 HTML 对齐（`markdown_to_pdf` / reportlab）
+
+将 reportlab 生成的 PDF 样式与 HTML CSS 完全对齐：
+
+| 元素 | 旧样式 | 新样式 |
+|---|---|---|
+| 颜色常量 | `#1a1a2e` / `#4C72B0` | `C_NAVY=#1B3A6B` / `C_ORANGE=#E87722` |
+| 封面 | 简单标题 + HR | KeepTogether（橙色 badge + 24pt 深海蓝标题 + 副标题 + 元数据 + 粗 HR）+ PageBreak |
+| H2 | 普通段落样式 | `_h2_flowable()`：`Table + LINEBEFORE(4pt, C_ORANGE)` 模拟 CSS `border-left` |
+| 表头 | 浅蓝背景 | `C_NAVY` 背景 + 白色文字 + 仅底部网格线 |
+
+---
+
+### BugFix：PDF 生成超时（>60s）
+
+**现象**：生成包含图表的 PDF 报告时提示"PDF 生成失败：PDF 生成超时（>60s），建议改用 Word 格式"。
+
+**根因**：`markdown_to_pdf` 内部的 `_add_sec_chart()` 和附录循环**串行**调用 `export_chart_as_png()`（每次最多 25s），3 张图 × 25s = 75s > PDF 超时上限 60s，必然超时。
+
+**修复（`src/report_builder.py` + `src/tools.py`）**：
+
+| 改动 | 内容 |
+|---|---|
+| `markdown_to_pdf` 新增 `chart_png_bytes` 参数 | 接收预导出的 PNG bytes 列表；`_pdf_charts` 字典增加 `'png'` 字段存储对应 bytes |
+| `_add_sec_chart()` 优先用已有 bytes | `png = c.get('png') or export_chart_as_png(c['fig'])`，有预导出结果时直接跳过耗时导出 |
+| 附录循环同步修改 | `_png = _c.get('png') or export_chart_as_png(_c['fig'])` |
+| `generate_report` 并行预导出 PNG | 在 60s 计时器**开始前**，用 `ThreadPoolExecutor(max_workers=4)` 并行导出所有图表（每张 28s 上限同时跑），再将 bytes 传入 `markdown_to_pdf` |
+| PDF 超时上限 60s → 120s | 兜底：应对并行导出本身较慢的场景 |
+
+**效果**：原来 N 张图串行耗时 `N × 25s`，现改为并行 `max(单张耗时) ≤ 28s`，3 张图从最坏 75s 压缩到 ≤28s。
+
+---
+
 ## 今日完成（2026-05-05）
 
 ### Week 3 · Day 22（下）：主动洞察 + 报告生成系统
