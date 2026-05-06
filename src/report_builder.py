@@ -251,9 +251,10 @@ def markdown_to_word(markdown_content: str, title: str) -> bytes:
 
 _PNG_TIMEOUT_SEC = 25  # kaleido 首次启动 Chromium 可能很慢，超时则跳过
 
-def export_chart_as_png(fig, width: int = 900, height: int = 450) -> bytes | None:
+def export_chart_as_png(fig, width: int = 1100, height: int = 500) -> bytes | None:
     """
     把 Plotly Figure 导出为 PNG bytes（需要 kaleido）。
+    默认 scale=2，实际像素 2200×1000，满足 A4 高清打印。
     - 找不到 kaleido 或超时（25 秒）时返回 None，不报错，报告继续生成。
     - 用独立线程执行，防止 kaleido 启动 Chromium 时阻塞主线程。
     """
@@ -280,152 +281,379 @@ def export_chart_as_png(fig, width: int = 900, height: int = 450) -> bytes | Non
 
 # ── 函数 3: build_html_report ────────────────────────────────────────────────
 
+# 专业报告 CSS（深海蓝 #1B3A6B + 橙色 #E87722，微软雅黑优先）
+_HTML_REPORT_CSS = """
+@page {
+    size: A4;
+    margin: 20mm 22mm 25mm 22mm;
+    @top-center {
+        content: element(header);
+        vertical-align: bottom;
+    }
+    @bottom-left {
+        content: "Confidential";
+        font-size: 8pt;
+        color: #9CA3AF;
+        font-family: 'Microsoft YaHei', sans-serif;
+    }
+    @bottom-right {
+        content: "第 " counter(page) " 页 / 共 " counter(pages) " 页";
+        font-size: 8pt;
+        color: #6B7280;
+        font-family: 'Microsoft YaHei', sans-serif;
+    }
+}
+
+#page-header {
+    position: running(header);
+    width: 100%;
+    border-bottom: 2px solid #1B3A6B;
+    padding-bottom: 4pt;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+#page-header .header-title {
+    font-size: 8.5pt;
+    color: #1B3A6B;
+    font-weight: 600;
+    font-family: 'Microsoft YaHei', sans-serif;
+}
+#page-header .header-date {
+    font-size: 8pt;
+    color: #9CA3AF;
+    font-family: 'Microsoft YaHei', sans-serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: 'Microsoft YaHei', 'PingFang SC', 'STHeiti',
+                 'WenQuanYi Micro Hei', 'Noto Sans CJK SC', sans-serif;
+    font-size: 10.5pt;
+    line-height: 1.75;
+    color: #2C2C2C;
+    background: white;
+}
+
+.cover {
+    text-align: center;
+    padding: 60pt 30pt 40pt 30pt;
+    border-bottom: 4px solid #1B3A6B;
+    margin-bottom: 36pt;
+    page-break-after: always;
+}
+.cover-tag {
+    display: inline-block;
+    background: #E87722;
+    color: white;
+    font-size: 8pt;
+    font-weight: 700;
+    letter-spacing: 2px;
+    padding: 3pt 10pt;
+    border-radius: 2pt;
+    margin-bottom: 20pt;
+    text-transform: uppercase;
+}
+.cover-title {
+    font-size: 24pt;
+    font-weight: 700;
+    color: #1B3A6B;
+    line-height: 1.3;
+    margin-bottom: 16pt;
+}
+.cover-subtitle {
+    font-size: 11pt;
+    color: #6B7280;
+    margin-bottom: 32pt;
+}
+.cover-meta {
+    font-size: 9pt;
+    color: #9CA3AF;
+    border-top: 1px solid #E5E7EB;
+    padding-top: 16pt;
+}
+.cover-meta span { margin: 0 12pt; }
+
+h1 {
+    font-size: 16pt;
+    font-weight: 700;
+    color: #1B3A6B;
+    margin-top: 30pt;
+    margin-bottom: 12pt;
+    padding-bottom: 6pt;
+    border-bottom: 2.5px solid #1B3A6B;
+    page-break-after: avoid;
+}
+h1 .section-num {
+    display: inline-block;
+    background: #1B3A6B;
+    color: white;
+    font-size: 9pt;
+    padding: 1pt 7pt;
+    border-radius: 2pt;
+    margin-right: 8pt;
+    vertical-align: middle;
+}
+h2 {
+    font-size: 13pt;
+    font-weight: 700;
+    color: #1B3A6B;
+    margin-top: 22pt;
+    margin-bottom: 8pt;
+    padding-left: 10pt;
+    border-left: 4px solid #E87722;
+    page-break-after: avoid;
+}
+h3 {
+    font-size: 11pt;
+    font-weight: 600;
+    color: #374151;
+    margin-top: 16pt;
+    margin-bottom: 6pt;
+    page-break-after: avoid;
+}
+p {
+    margin-bottom: 9pt;
+    text-align: justify;
+    orphans: 3;
+    widows: 3;
+}
+strong { color: #1B3A6B; font-weight: 700; }
+ul, ol { margin: 8pt 0 10pt 18pt; }
+li { margin-bottom: 4pt; line-height: 1.7; }
+li::marker { color: #E87722; }
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 14pt 0;
+    font-size: 9.5pt;
+    page-break-inside: avoid;
+}
+thead tr { background: #1B3A6B; color: white; }
+thead th {
+    padding: 8pt 10pt;
+    text-align: left;
+    font-weight: 600;
+    font-size: 9pt;
+    letter-spacing: 0.3px;
+}
+thead th:first-child, tbody td:first-child { text-align: center; }
+tbody tr:nth-child(even) { background: #F5F7FA; }
+tbody tr:hover { background: #EFF6FF; }
+tbody td {
+    padding: 7pt 10pt;
+    border-bottom: 1px solid #E5E7EB;
+    color: #374151;
+}
+tbody td:not(:first-child):not(:nth-child(2)) { text-align: right; }
+tbody tr.highlight td { font-weight: 700; color: #1B3A6B; }
+.table-caption {
+    font-size: 9pt; color: #6B7280;
+    text-align: center; margin-top: -8pt; margin-bottom: 12pt; font-style: italic;
+}
+
+.chart-container {
+    margin: 16pt 0;
+    text-align: center;
+    page-break-inside: avoid;
+}
+.chart-container img {
+    max-width: 100%;
+    border: 1px solid #E5E7EB;
+    border-radius: 4pt;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+}
+.chart-caption {
+    font-size: 8.5pt; color: #6B7280;
+    margin-top: 6pt; font-style: italic; text-align: center;
+}
+.chart-number { font-weight: 700; color: #1B3A6B; }
+
+.page-break { page-break-before: always; }
+.no-break { page-break-inside: avoid; }
+
+.appendix {
+    border-top: 2px solid #E5E7EB;
+    margin-top: 30pt;
+    padding-top: 20pt;
+}
+.appendix h1 { color: #6B7280; border-bottom-color: #E5E7EB; font-size: 14pt; }
+
+.watermark {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%) rotate(-35deg);
+    font-size: 60pt;
+    color: rgba(27, 58, 107, 0.04);
+    font-weight: 900;
+    pointer-events: none;
+    z-index: -1;
+    white-space: nowrap;
+}
+"""
+
+
+def _chart_html(chart_n: int, b64: str, caption: str) -> str:
+    """生成单张图表的 HTML 片段。"""
+    return (
+        f'<div class="chart-container">'
+        f'<img src="data:image/png;base64,{b64}" alt="{caption}"/>'
+        f'<p class="chart-caption">'
+        f'<span class="chart-number">图{chart_n}</span> {caption}'
+        f'</p></div>'
+    )
+
+
+def _match_chart_for_section(section_title: str, unplaced: list) -> dict | None:
+    """
+    按两级优先级为章节标题匹配最合适的图表。
+    优先级1：图表标题包含章节关键词（bigram 或英文词）。
+    优先级2：章节与图表标题的 bigram 集合有交集。
+    匹配到后将 chart dict 的 'placed' 设为 True 并返回。
+    """
+    def keywords(s: str) -> set:
+        """提取关键词：汉字连续串的所有 2-gram + 3字以上英文词。"""
+        result = set()
+        # 英文词（3字以上）
+        for w in re.findall(r'[a-zA-Z]{3,}', s):
+            result.add(w.lower())
+        # 汉字连续串 → 逐个 2-gram
+        for run in re.findall(r'[一-鿿]+', s):
+            for i in range(len(run) - 1):
+                result.add(run[i:i + 2])
+        return result
+
+    sec_kw = keywords(section_title)
+    if not sec_kw:
+        return None
+
+    # 优先级 1：图表标题作为字符串直接包含章节中的某个关键词
+    for c in unplaced:
+        for w in sec_kw:
+            if w in c['caption']:
+                c['placed'] = True
+                return c
+    # 优先级 2：关键词集合有交集
+    for c in unplaced:
+        if sec_kw & keywords(c['caption']):
+            c['placed'] = True
+            return c
+    return None
+
+
 def build_html_report(
     markdown_content: str,
     title: str,
-    chart_figures: list,
-    chart_captions: list,
+    chart_figures: list = None,
+    chart_captions: list = None,
+    generated_date: str = None,
 ) -> str:
     """
-    把 Markdown 内容 + Plotly 图表 合并成一个完整 HTML 字符串。
-    是 PDF 生成的中间产物。
+    把 Markdown 报告内容 + Plotly 图表合并为专业排版的 HTML。
+
+    图表匹配规则：
+    - 按章节（## 标题）关键词匹配，优先完全包含，其次关键词交集
+    - 匹配到的图表嵌入对应章节末尾；未匹配的图表汇总到附图附录
     """
     import markdown as md_lib
 
-    # Step 1: Markdown → HTML 片段
+    chart_figures  = chart_figures  or []
+    chart_captions = chart_captions or []
+    if not generated_date:
+        generated_date = datetime.now().strftime("%Y年%m月%d日 %H:%M")
+
+    # ── Step 1: 导出所有图表为 base64 PNG ──────────────────────────────────────
+    chart_data = []
+    for i, (fig, cap) in enumerate(zip(chart_figures, chart_captions)):
+        png_bytes = export_chart_as_png(fig, width=1100, height=500)
+        if png_bytes:
+            chart_data.append({
+                'index':   i + 1,
+                'caption': cap,
+                'b64':     base64.b64encode(png_bytes).decode(),
+                'placed':  False,
+            })
+
+    # ── Step 2: Markdown → HTML ────────────────────────────────────────────────
     body_html = md_lib.markdown(
         markdown_content,
-        extensions=["tables", "fenced_code"],
+        extensions=['tables', 'fenced_code', 'nl2br'],
     )
 
-    # Step 2: 图表截图嵌入（PNG base64）
-    for fig, caption in zip(chart_figures, chart_captions):
-        png_bytes = export_chart_as_png(fig)
-        if png_bytes:
-            b64 = base64.b64encode(png_bytes).decode()
-            img_tag = (
-                f'<figure>'
-                f'<img src="data:image/png;base64,{b64}" '
-                f'style="width:100%;max-width:800px;"/>'
-                f'<figcaption>{caption}</figcaption>'
-                f'</figure>'
-            )
-            body_html += img_tag
-        else:
-            body_html += f'<p><em>[图表"{caption}"无法嵌入，请在 Agent 界面查看]</em></p>'
+    # ── Step 3: 按 <h2> 章节分段，匹配并插入图表 ─────────────────────────────
+    # 用 re.split 把 body_html 按 <h2>...</h2> 切割
+    # 结果格式：[before_h2, h2_tag, section_content, h2_tag, section_content, ...]
+    parts = re.split(r'(<h2>[^<]*</h2>)', body_html)
 
-    # Step 3: 完整 HTML + CSS
-    generated_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-    html = f"""<!DOCTYPE html>
+    result_parts = []
+    chart_n = 0  # 全局图表编号
+    unplaced = [c for c in chart_data]  # 尚未放置的图表（共享引用）
+
+    for idx, part in enumerate(parts):
+        result_parts.append(part)
+        m = re.match(r'<h2>([^<]*)</h2>', part)
+        if not m:
+            continue
+        section_title = m.group(1)
+        # 在 unplaced 里找本章节图表，插入到下一个 h2 之前（即当前 section_content 末尾）
+        # section_content 在 parts[idx+1]（如果存在）
+        # 不修改 parts[idx+1]；改为在 parts[idx+1] 之后插入图表 HTML
+        matched = _match_chart_for_section(section_title, [c for c in unplaced if not c['placed']])
+        if matched:
+            chart_n += 1
+            matched['placed'] = True
+            matched['chart_n'] = chart_n  # 更新实际编号
+            # 将图表注入紧跟在该章节内容之后
+            # 找到本 h2 对应的 section_content（parts[idx+1]），在其末尾插入
+            if idx + 1 < len(parts):
+                result_parts.append(parts[idx + 1])   # section content
+                result_parts.append(_chart_html(chart_n, matched['b64'], matched['caption']))
+                # 跳过 parts[idx+1]，否则会被再次 append 在下一轮
+                parts[idx + 1] = ''  # 已处理，清空防止重复
+            else:
+                result_parts.append(_chart_html(chart_n, matched['b64'], matched['caption']))
+
+    body_with_charts = ''.join(result_parts)
+
+    # ── Step 4: 未匹配图表放附录 ───────────────────────────────────────────────
+    still_unplaced = [c for c in chart_data if not c['placed']]
+    appendix_html = ''
+    if still_unplaced:
+        appendix_html = '<div class="appendix"><h1>附图</h1>'
+        for c in still_unplaced:
+            chart_n += 1
+            appendix_html += _chart_html(chart_n, c['b64'], c['caption'])
+        appendix_html += '</div>'
+
+    # ── Step 5: 组装完整 HTML ──────────────────────────────────────────────────
+    return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <title>{title}</title>
-    <style>
-        @page {{
-            size: A4;
-            margin: 15mm 20mm;
-            @top-right {{ content: "{title}"; font-size: 9pt; color: #888; }}
-            @bottom-right {{ content: "第 " counter(page) " 页"; font-size: 9pt; color: #888; }}
-            @bottom-left {{ content: "{generated_date}"; font-size: 9pt; color: #888; }}
-        }}
-        body {{
-            font-family: 'Microsoft YaHei', 'SimHei', 'STHeiti', sans-serif;
-            font-size: 11pt;
-            line-height: 1.6;
-            color: #333;
-        }}
-        h1 {{
-            font-size: 18pt;
-            font-weight: bold;
-            margin-top: 20pt;
-            margin-bottom: 8pt;
-            color: #1a1a2e;
-            border-bottom: 2px solid #4C72B0;
-            padding-bottom: 4pt;
-        }}
-        h2 {{
-            font-size: 14pt;
-            font-weight: bold;
-            margin-top: 14pt;
-            margin-bottom: 6pt;
-            color: #1a1a2e;
-        }}
-        h3 {{
-            font-size: 12pt;
-            font-weight: bold;
-            margin-top: 10pt;
-            margin-bottom: 4pt;
-        }}
-        p {{ margin: 6pt 0; }}
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin: 10pt 0;
-            font-size: 10pt;
-        }}
-        th {{
-            background-color: #F2F2F2;
-            font-weight: bold;
-            text-align: left;
-        }}
-        td, th {{
-            border: 1px solid #DDD;
-            padding: 6px 10px;
-        }}
-        tr:nth-child(even) {{ background-color: #FAFAFA; }}
-        img {{
-            max-width: 100%;
-            display: block;
-            margin: 10px auto;
-        }}
-        figure {{
-            text-align: center;
-            margin: 16px 0;
-        }}
-        figcaption {{
-            font-size: 9pt;
-            color: #666;
-            margin-top: 4px;
-        }}
-        code {{
-            background: #F5F5F5;
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-size: 10pt;
-        }}
-        pre {{
-            background: #F5F5F5;
-            padding: 12px;
-            border-radius: 4px;
-            font-size: 10pt;
-            overflow-x: auto;
-        }}
-        ul, ol {{ padding-left: 1.5em; margin: 6pt 0; }}
-        li {{ margin: 3pt 0; }}
-        hr {{
-            border: none;
-            border-top: 1px solid #CCC;
-            margin: 12pt 0;
-        }}
-        blockquote {{
-            border-left: 4px solid #4C72B0;
-            margin: 10pt 0;
-            padding: 4pt 12pt;
-            color: #555;
-        }}
-    </style>
+    <style>{_HTML_REPORT_CSS}</style>
 </head>
 <body>
-    <h1 style="text-align:center;border-bottom:none;">{title}</h1>
-    <p style="text-align:center;color:#888;font-size:9pt">
-        生成时间：{generated_date}
-    </p>
-    <hr/>
-    {body_html}
+    <div class="watermark">CONFIDENTIAL</div>
+    <div id="page-header">
+        <span class="header-title">{title}</span>
+        <span class="header-date">{generated_date}</span>
+    </div>
+    <div class="cover">
+        <div class="cover-tag">Analysis Report</div>
+        <div class="cover-title">{title}</div>
+        <div class="cover-subtitle">AI 数据分析 Agent 自动生成</div>
+        <div class="cover-meta">
+            <span>生成时间: {generated_date}</span>
+            <span>数据来源: Olist Brazilian E-Commerce</span>
+        </div>
+    </div>
+    {body_with_charts}
+    {appendix_html}
 </body>
 </html>"""
-    return html
 
 
 # ── 函数 4a: _build_pdf_safe_html（PDF 专用简化 HTML）────────────────────────
@@ -486,17 +714,23 @@ hr     {{ border: none; border-top: 1px solid #CCC; margin: 12pt 0; }}
 
 # ── 函数 4b & 5: markdown_to_pdf（reportlab 直接生成）────────────────────────
 
-# 候选中文 TTF 字体路径（按优先级）
+# 候选中文字体路径（按优先级）；.ttc 用 subfontIndex=0 加载
 _CJK_FONT_PATHS = [
-    r"C:\Windows\Fonts\simhei.ttf",
+    r"C:\Windows\Fonts\msyh.ttc",       # 微软雅黑 Regular（Win10/11，字形最全）
+    r"C:\Windows\Fonts\msyh.ttf",       # 部分系统为 TTF 格式
+    r"C:\Windows\Fonts\msyhbd.ttc",     # 微软雅黑 Bold（备用）
+    r"C:\Windows\Fonts\simhei.ttf",     # 黑体（旧系统备选）
     r"C:\Windows\Fonts\simkai.ttf",
     r"C:\Windows\Fonts\simfang.ttf",
     r"C:\Windows\Fonts\STZHONGS.TTF",
 ]
 
 
-def _register_cjk_font() -> str:
-    """注册第一个可用的 CJK TTF 字体，返回已注册的字体名。找不到返回 'Helvetica'。"""
+def _register_cjk_font() -> tuple:
+    """
+    注册第一个可用的 CJK 字体（TTF/TTC），返回 (字体名, 字体路径)。
+    找不到可用字体时返回 ('Helvetica', '')。
+    """
     import os
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
@@ -507,11 +741,14 @@ def _register_cjk_font() -> str:
         font_name = "CJKFont"
         if font_name not in pdfmetrics.getRegisteredFontNames():
             try:
-                pdfmetrics.registerFont(TTFont(font_name, path))
+                if path.lower().endswith(".ttc"):
+                    pdfmetrics.registerFont(TTFont(font_name, path, subfontIndex=0))
+                else:
+                    pdfmetrics.registerFont(TTFont(font_name, path))
             except Exception:
                 continue
-        return font_name
-    return "Helvetica"
+        return font_name, path
+    return "Helvetica", ""
 
 
 def markdown_to_pdf(
@@ -519,64 +756,119 @@ def markdown_to_pdf(
     title: str,
     chart_figures: list = None,
     chart_captions: list = None,
+    chart_png_bytes: list = None,
 ) -> bytes:
     """
     Markdown → PDF，使用 reportlab 直接生成（不经过 xhtml2pdf/HTML）。
     中文字体通过 pdfmetrics.registerFont 嵌入，彻底解决乱码问题。
+    chart_png_bytes: 可选，预先导出的 PNG bytes 列表（与 chart_figures 等长）。
+    传入时直接使用，跳过 export_chart_as_png，避免在 60s 超时内串行导出超时。
     """
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import mm
     from reportlab.lib.colors import HexColor, white
-    pt = 1  # reportlab 坐标系本身就是 points，pt=1 是惯例
+    pt = 1
     from reportlab.platypus import (
         SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-        HRFlowable, ListFlowable, ListItem,
+        HRFlowable, PageBreak, KeepTogether,
     )
 
-    FONT    = _register_cjk_font()
-    C_DARK  = HexColor("#1a1a2e")
-    C_BLUE  = HexColor("#4C72B0")
-    C_GRAY  = HexColor("#888888")
-    C_LIGHT = HexColor("#EEF2FA")   # 表头背景，蓝调
-    C_ROW2  = HexColor("#F8F9FC")   # 偶数行背景
-    C_BDR   = HexColor("#C8D0DC")   # 表格边框
+    FONT, _font_path = _register_cjk_font()
+    _is_yahe = "msyh" in _font_path.lower()
+
+    # ── 颜色（与 HTML CSS 完全对齐）──────────────────────────────────────────
+    C_NAVY   = HexColor("#1B3A6B")   # 深海蓝：标题、边框、表头
+    C_ORANGE = HexColor("#E87722")   # 橙色：h2 左边框、badge
+    C_DARK   = HexColor("#2C2C2C")   # 正文深灰
+    C_GRAY   = HexColor("#6B7280")   # 辅助中灰
+    C_LIGHT  = HexColor("#F5F7FA")   # 偶数行背景
+    C_BDR    = HexColor("#E5E7EB")   # 边框浅灰
+    C_META   = HexColor("#9CA3AF")   # 封面元数据灰
 
     def S(name, **kw):
         return ParagraphStyle(name, fontName=FONT, **kw)
 
-    # 样式对照网页版：标题大且居中，H2 明显加大，表头加粗
-    s_title  = S("T",  fontSize=20, textColor=C_DARK, alignment=1,
-                 spaceAfter=6*pt, leading=26)
-    s_date   = S("D",  fontSize=9,  textColor=C_GRAY, alignment=1,
-                 spaceAfter=14*pt, leading=13)
-    s_h1     = S("H1", fontSize=16, textColor=C_DARK, spaceBefore=14*pt,
-                 spaceAfter=5*pt,  leading=22)
-    s_h2     = S("H2", fontSize=14, textColor=C_DARK, spaceBefore=12*pt,
-                 spaceAfter=4*pt,  leading=20)
-    s_h3     = S("H3", fontSize=11, textColor=HexColor("#2c3e6e"),
-                 spaceBefore=9*pt, spaceAfter=3*pt, leading=16)
-    s_body   = S("B",  fontSize=10, textColor=HexColor("#333333"),
-                 spaceAfter=5*pt,  leading=17)
-    s_bullet = S("BL", fontSize=10, textColor=HexColor("#333333"),
-                 spaceAfter=3*pt,  leading=16, leftIndent=14*pt, firstLineIndent=0)
-    s_num    = S("NL", fontSize=10, textColor=HexColor("#333333"),
-                 spaceAfter=3*pt,  leading=16, leftIndent=18*pt, firstLineIndent=-18*pt)
-    s_cell   = S("C",  fontSize=9,  textColor=HexColor("#333333"), leading=14)
-    s_hcell  = S("HC", fontSize=9,  textColor=HexColor("#1a1a2e"),  leading=14)
+    # ── 样式定义（对照 HTML CSS）─────────────────────────────────────────────
+    # 封面
+    s_badge    = S("BDG", fontSize=8,  textColor=white,   alignment=1,
+                   leading=10,  spaceAfter=0)
+    s_title    = S("T",   fontSize=24, textColor=C_NAVY,  alignment=1,
+                   leading=30,  spaceBefore=0, spaceAfter=10*pt)
+    s_subtitle = S("SUB", fontSize=11, textColor=C_GRAY,  alignment=1,
+                   leading=16,  spaceAfter=24*pt)
+    s_meta     = S("MTA", fontSize=9,  textColor=C_META,  alignment=1,
+                   leading=13,  spaceAfter=0)
+    # 正文
+    s_date     = S("D",   fontSize=9,  textColor=C_GRAY,  alignment=1,
+                   leading=13,  spaceAfter=6*pt)
+    s_h1       = S("H1",  fontSize=16, textColor=C_NAVY,
+                   spaceBefore=22*pt, spaceAfter=6*pt, leading=22)
+    s_h2_text  = S("H2T", fontSize=13, textColor=C_NAVY,
+                   spaceBefore=0, spaceAfter=0, leading=20)
+    s_h3       = S("H3",  fontSize=11, textColor=HexColor("#374151"),
+                   spaceBefore=9*pt, spaceAfter=3*pt, leading=16)
+    s_body     = S("B",   fontSize=10, textColor=C_DARK,
+                   spaceAfter=6*pt, leading=17)
+    s_bullet   = S("BL",  fontSize=10, textColor=C_DARK,
+                   spaceAfter=3*pt, leading=16, leftIndent=14*pt)
+    s_num      = S("NL",  fontSize=10, textColor=C_DARK,
+                   spaceAfter=3*pt, leading=16, leftIndent=18*pt, firstLineIndent=-18*pt)
+    s_cell     = S("C",   fontSize=9,  textColor=HexColor("#374151"), leading=14)
+    s_hcell    = S("HC",  fontSize=9,  textColor=white,  leading=14)
+
+    def _h2_flowable(text: str) -> Table:
+        """H2：用 Table + LINEBEFORE 模拟 CSS border-left: 4px solid #E87722。"""
+        cell = Paragraph(text, s_h2_text)
+        tbl  = Table([[cell]], colWidths=[avail_w])
+        tbl.setStyle(TableStyle([
+            ("LEFTPADDING",    (0, 0), (-1, -1), 12),
+            ("RIGHTPADDING",   (0, 0), (-1, -1), 0),
+            ("TOPPADDING",     (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING",  (0, 0), (-1, -1), 5),
+            ("LINEBEFORE",     (0, 0), (0,  -1), 4, C_ORANGE),
+        ]))
+        return tbl
 
     # ── 符号安全转换 ─────────────────────────────────────────────────────────
-    # ¥（全角 U+FFE5）→ ¥（半角 U+00A5），SimHei 有半角 ¥ 字形
-    # 常见特殊符号保留，不做替换
-    _SYM_MAP = {
-        "￥": "¥",   # ￥ → ¥
-        "’": "'",         # 右单引号
-        "‘": "'",         # 左单引号
-        "“": '"',         # 左双引号
-        "”": '"',         # 右双引号
-        "–": "-",         # en dash
-        "—": "--",        # em dash
+    # 层1：不管用哪种字体都要转（XML 安全 + 全角半角统一）
+    _SYM_ALWAYS = {
+        '￥': '¥',      # ￿e5(full-width) -> ¥ (half-width yen/yuan)
+        '‘': "'",         # ‘ left single curly quote
+        '’': "'",         # ’ right single curly quote
+        '“': '"',         # “ left double curly quote
+        '”': '"',         # ” right double curly quote
+        '–': '-',          # en dash
+        '—': '--',         # em dash
+        '…': '...',        # ellipsis
+        **{chr(0xFF01 + i): chr(0x21 + i) for i in range(94)},  # full-width ASCII -> half
     }
+    _SYM_FALLBACK = {   # only applied when font is NOT YaHei (SimHei fallback)
+        '×':   'x',     # x (multiplication)
+        '÷':   '/',     # / (division)
+        '±':   '+/-',   # +/- (plus-minus)
+        '≥': '>=',    # >=
+        '≤': '<=',    # <=
+        '≠': '!=',    # !=
+        '≈': '~=',    # approximately
+        '√': 'sqrt',  # sqrt
+        '∞': 'inf',   # infinity
+        '∑': 'sum',   # sum
+        '→': '->',    # right arrow
+        '←': '<-',    # left arrow
+        '↑': '^',     # up arrow
+        '↓': 'v',     # down arrow
+        '▲': '(+)',   # up triangle
+        '▼': '(-)',   # down triangle
+        '©':   '(c)',   # copyright
+        '®':   '(R)',   # registered
+        '™': '(TM)',  # trademark
+        '·':   '.',     # middle dot
+        **{chr(0x2460 + i): str(i + 1) for i in range(20)},  # circled 1-20
+    }
+    _SYM_MAP = dict(_SYM_ALWAYS)
+    if not _is_yahe:
+        _SYM_MAP.update(_SYM_FALLBACK)
 
     def inline(text: str) -> str:
         """XML 转义 + 符号规范化 + **bold** → <b>。"""
@@ -596,16 +888,75 @@ def markdown_to_pdf(
     story = []
     generated_date = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # 封面区
-    story.append(Paragraph(inline(title), s_title))
-    story.append(HRFlowable(width="100%", thickness=2, color=C_BLUE, spaceAfter=4*pt))
-    story.append(Paragraph(f"生成时间：{generated_date}", s_date))
-    story.append(HRFlowable(width="100%", thickness=0.5, color=C_BDR))
-    story.append(Spacer(1, 8*pt))
-
     lines   = markdown_content.split("\n")
     i       = 0
     avail_w = A4[0] - 40*mm
+
+    # ── 封面页（对照 HTML cover 设计）────────────────────────────────────────
+    # "ANALYSIS REPORT" 橙色 badge（居中 Table）
+    badge_tbl = Table([[Paragraph("ANALYSIS REPORT", s_badge)]],
+                      colWidths=[70*mm])
+    badge_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), C_ORANGE),
+        ("TOPPADDING",    (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 10),
+        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+    ]))
+    badge_tbl.hAlign = "CENTER"
+
+    cover = KeepTogether([
+        Spacer(1, 50*pt),
+        badge_tbl,
+        Spacer(1, 18*pt),
+        Paragraph(inline(title), s_title),
+        Paragraph("AI 数据分析 Agent 自动生成", s_subtitle),
+        HRFlowable(width="100%", thickness=1, color=C_BDR, spaceAfter=12*pt),
+        Paragraph(
+            f"生成时间：{generated_date}　　数据来源：Olist Brazilian E-Commerce",
+            s_meta,
+        ),
+        Spacer(1, 36*pt),
+        HRFlowable(width="100%", thickness=4, color=C_NAVY),
+    ])
+    story.append(cover)
+    story.append(PageBreak())
+
+    # ── 图表嵌入：预计算 section→chart 映射 ───────────────────────────────────
+    _chart_figs  = chart_figures   or []
+    _chart_caps  = chart_captions  or []
+    _chart_bytes = chart_png_bytes or [None] * len(_chart_figs)
+    _pdf_charts  = [
+        {'caption': cap, 'fig': fig, 'png': png, 'placed': False}
+        for fig, cap, png in zip(_chart_figs, _chart_caps, _chart_bytes)
+    ]
+    _sec_titles = re.findall(r'^## +(.+)$', markdown_content, re.MULTILINE)
+    _sec_chart_map = {}
+    for _si, _st in enumerate(_sec_titles):
+        _candidates = [c for c in _pdf_charts if not c['placed']]
+        _mc = _match_chart_for_section(_st, _candidates)
+        if _mc:
+            _sec_chart_map[_si] = _mc
+    _cur_sec = [-1]  # list 让闭包内可修改
+
+    def _add_sec_chart():
+        """把当前章节匹配的图表插入 story；无可用图表或导出失败时直接跳过。"""
+        idx = _cur_sec[0]
+        if idx < 0:
+            return
+        c = _sec_chart_map.get(idx)
+        if c is None:
+            return
+        png = c.get('png') or export_chart_as_png(c['fig'])
+        if png is None:
+            return
+        c['png'] = png  # 缓存，避免重复导出
+        from reportlab.platypus import Image as _RLImage
+        story.append(Spacer(1, 6 * pt))
+        story.append(_RLImage(BytesIO(png), width=avail_w, height=avail_w * 500 / 1100))
+        story.append(Paragraph(f"图: {c['caption']}", s_date))
+        story.append(Spacer(1, 8 * pt))
 
     while i < len(lines):
         line     = lines[i]
@@ -613,14 +964,15 @@ def markdown_to_pdf(
 
         if re.match(r'^# [^#]', stripped):
             story.append(Paragraph(inline(stripped[2:]), s_h1))
-            story.append(HRFlowable(width="100%", thickness=1, color=C_BLUE, spaceAfter=4*pt))
+            story.append(HRFlowable(width="100%", thickness=2, color=C_NAVY, spaceAfter=5*pt))
             i += 1
 
         elif re.match(r'^## [^#]', stripped):
-            story.append(Spacer(1, 2*pt))
-            story.append(Paragraph(inline(stripped[3:]), s_h2))
-            story.append(HRFlowable(width="60%", thickness=0.8, color=C_BLUE,
-                                    spaceAfter=3*pt))
+            _add_sec_chart()           # 把上一章节匹配的图表插在章节末尾
+            _cur_sec[0] += 1
+            story.append(Spacer(1, 14*pt))
+            story.append(_h2_flowable(inline(stripped[3:])))
+            story.append(Spacer(1, 5*pt))
             i += 1
 
         elif re.match(r'^### ', stripped):
@@ -671,21 +1023,21 @@ def markdown_to_pdf(
                     pdf_data.append([Paragraph(inline(c), sty) for c in row])
                 t = Table(pdf_data, colWidths=[col_w] * n_cols, repeatRows=1)
                 ts = [
-                    ("BACKGROUND",    (0, 0),  (-1, 0),  C_LIGHT),
+                    # 表头：深海蓝背景 + 白色文字（对齐 HTML）
+                    ("BACKGROUND",    (0, 0),  (-1, 0),  C_NAVY),
+                    ("TEXTCOLOR",     (0, 0),  (-1, 0),  white),
                     ("FONTNAME",      (0, 0),  (-1, -1), FONT),
                     ("FONTSIZE",      (0, 0),  (-1, -1), 9),
-                    ("FONTNAME",      (0, 0),  (-1, 0),  FONT),   # 表头同字体，靠 BOLD 加粗
-                    ("BOLD",          (0, 0),  (-1, 0),  True),   # 仅在 reportlab >= 3.5 有效
-                    ("GRID",          (0, 0),  (-1, -1), 0.5, C_BDR),
-                    ("TOPPADDING",    (0, 0),  (-1, -1), 5),
-                    ("BOTTOMPADDING", (0, 0),  (-1, -1), 5),
-                    ("LEFTPADDING",   (0, 0),  (-1, -1), 7),
-                    ("RIGHTPADDING",  (0, 0),  (-1, -1), 7),
-                    ("LINEABOVE",     (0, 0),  (-1, 0),  1.5, C_BLUE),  # 表头顶部粗线
-                    ("LINEBELOW",     (0, 0),  (-1, 0),  1,   C_BLUE),  # 表头底部线
+                    ("BOLD",          (0, 0),  (-1, 0),  True),
+                    # 边框：仅底部分割线，无竖线（接近 HTML 表格风格）
+                    ("LINEBELOW",     (0, 0),  (-1, -2), 0.5, C_BDR),
+                    ("TOPPADDING",    (0, 0),  (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0),  (-1, -1), 6),
+                    ("LEFTPADDING",   (0, 0),  (-1, -1), 8),
+                    ("RIGHTPADDING",  (0, 0),  (-1, -1), 8),
                 ]
                 for ri in range(1, len(pdf_data)):
-                    bg = C_ROW2 if ri % 2 == 0 else white
+                    bg = C_LIGHT if ri % 2 == 0 else white
                     ts.append(("BACKGROUND", (0, ri), (-1, ri), bg))
                 t.setStyle(TableStyle(ts))
                 story.append(t)
@@ -698,6 +1050,25 @@ def markdown_to_pdf(
         else:
             story.append(Paragraph(inline(stripped), s_body))
             i += 1
+
+    # 最后一个章节的图表
+    _add_sec_chart()
+
+    # 未匹配的图表统一追加到附录
+    _unplaced = [c for c in _pdf_charts if not c['placed']]
+    if _unplaced:
+        story.append(Spacer(1, 12 * pt))
+        story.append(HRFlowable(width="100%", thickness=1, color=C_BDR))
+        story.append(Spacer(1, 4 * pt))
+        story.append(Paragraph("附图", s_h1))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=C_BLUE, spaceAfter=4 * pt))
+        for _c in _unplaced:
+            _png = export_chart_as_png(_c['fig'])
+            if _png is not None:
+                from reportlab.platypus import Image as _RLImage
+                story.append(_RLImage(BytesIO(_png), width=avail_w, height=avail_w * 500 / 1100))
+                story.append(Paragraph(f"图: {_c['caption']}", s_date))
+                story.append(Spacer(1, 8 * pt))
 
     doc.build(story)
     return buf.getvalue()

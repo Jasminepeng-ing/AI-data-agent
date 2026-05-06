@@ -29,7 +29,15 @@
       "Bash(D:/Anaconda3/python.exe -c ' *)",
       "Bash(D:/Anaconda3/python.exe -m pip install xhtml2pdf)",
       "Bash(streamlit run *)",
-      "mcp__Claude_in_Chrome__tabs_context_mcp"
+      "mcp__Claude_in_Chrome__tabs_context_mcp",
+      "Bash(pip show *)",
+      "Bash(pip list *)",
+      "Bash(where python *)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(conda run *)",
+      "Bash(cat)",
+      "Bash(D:/Anaconda3/python.exe /tmp/test_sym.py)",
+      "Bash(D:/Anaconda3/python.exe /tmp/test_pdf2.py)"
     ]
   }
 }

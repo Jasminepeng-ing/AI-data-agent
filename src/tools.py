@@ -1328,12 +1328,11 @@ def generate_report(
     else:
         _fmts = set(output_format.replace(",", "+").split("+"))
 
-    figures  = []
-    captions = []
-    if embed_charts:
-        chart_reg = st.session_state.get("chart_registry", [])
-        figures  = [item["fig"]     for item in chart_reg if item.get("fig") is not None]
-        captions = [item["caption"] for item in chart_reg if item.get("fig") is not None]
+    # 始终收集本轮图表（embed_charts 控制是否传给 build_html_report，PDF 始终嵌入）
+    chart_reg = st.session_state.get("chart_registry", [])
+    valid_charts = [item for item in chart_reg if item.get("fig") is not None]
+    figures  = [item["fig"]     for item in valid_charts]
+    captions = [item["caption"] for item in valid_charts]
 
     report_output = {
         "title":         report_title,
@@ -1341,6 +1340,7 @@ def generate_report(
         "output_format": output_format,
         "figures":       figures,
         "captions":      captions,
+        "chart_count":   len(figures),
     }
 
     # Word 生成（30s 超时）

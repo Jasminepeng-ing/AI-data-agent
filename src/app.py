@@ -493,48 +493,58 @@ def _render_report_output(rpt: dict) -> None:
     content       = rpt.get("content", "")
     output_format = rpt.get("output_format", "all")
 
+    # 统一解析格式：支持 "all" / "markdown" / "word" / "pdf" / "word+pdf" 等复合格式
+    if output_format == "all":
+        fmts = {"markdown", "word", "pdf"}
+    else:
+        fmts = set(output_format.replace(",", "+").split("+"))
+
     st.divider()
     st.markdown(f"### 📄 报告：{title}")
 
     # Markdown 内联展示
-    if output_format in ("markdown", "all"):
+    if "markdown" in fmts:
         with st.expander("📝 查看报告内容", expanded=True):
             st.markdown(content)
 
-    # 下载按钮行
-    col_word, col_pdf, _ = st.columns([1.5, 1.5, 4])
+    # 下载按钮行（只在有 word 或 pdf 时才创建列布局）
+    has_word = "word" in fmts
+    has_pdf  = "pdf"  in fmts
+    if has_word or has_pdf:
+        col_word, col_pdf, _ = st.columns([1.5, 1.5, 4])
 
-    # Word 下载
-    if output_format in ("word", "all"):
-        word_bytes = rpt.get("word_bytes")
-        word_error = rpt.get("word_error")
-        with col_word:
-            if word_bytes:
-                st.download_button(
-                    label="📄 下载 Word 报告",
-                    data=word_bytes,
-                    file_name=f"{title}.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key=f"dl_word_{id(rpt)}",
-                )
-            elif word_error:
-                st.error(f"Word 生成失败：{word_error}")
+        if has_word:
+            word_bytes = rpt.get("word_bytes")
+            word_error = rpt.get("word_error")
+            with col_word:
+                if word_bytes:
+                    st.download_button(
+                        label="📄 下载 Word 报告",
+                        data=word_bytes,
+                        file_name=f"{title}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key=f"dl_word_{id(rpt)}",
+                    )
+                elif word_error:
+                    st.error(f"Word 生成失败：{word_error}")
 
-    # PDF 下载
-    if output_format in ("pdf", "all"):
-        pdf_bytes = rpt.get("pdf_bytes")
-        pdf_error = rpt.get("pdf_error")
-        with col_pdf:
-            if pdf_bytes:
-                st.download_button(
-                    label="📑 下载 PDF 报告",
-                    data=pdf_bytes,
-                    file_name=f"{title}.pdf",
-                    mime="application/pdf",
-                    key=f"dl_pdf_{id(rpt)}",
-                )
-            elif pdf_error:
-                st.error(f"PDF 生成失败：{pdf_error}")
+        if has_pdf:
+            pdf_bytes = rpt.get("pdf_bytes")
+            pdf_error = rpt.get("pdf_error")
+            with col_pdf:
+                if pdf_bytes:
+                    chart_count = rpt.get("chart_count", 0)
+                    st.download_button(
+                        label="📑 下载 PDF 报告",
+                        data=pdf_bytes,
+                        file_name=f"{title}.pdf",
+                        mime="application/pdf",
+                        key=f"dl_pdf_{id(rpt)}",
+                    )
+                    if chart_count > 0:
+                        st.caption(f"📊 本 PDF 包含本轮 {chart_count} 张图表截图")
+                elif pdf_error:
+                    st.error(f"PDF 生成失败：{pdf_error}")
 
 
 # ── 快捷报告生成按钮 ──────────────────────────────────────────────────────────
