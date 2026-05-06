@@ -4,3 +4,4 @@ duckdb
 plotly
 weasyprint
 python-dotenv
+openai
