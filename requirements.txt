@@ -2,6 +2,8 @@ streamlit
 pandas
 duckdb
 plotly
+kaleido
 weasyprint
+reportlab
 python-dotenv
 openai

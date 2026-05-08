@@ -1,5 +1,228 @@
 # AI 数据分析 Agent · 开发进度
 
+---
+
+## ⏳ 待处理 Bug（2026-05-09 记录）
+
+### Bug-1：Word 生成失败（`name 'note_run' is not defined`）
+
+**现象**：点击下载 Word 报告时控制台报 `NameError: name 'note_run' is not defined`，Word 文件无法生成。
+
+**推测根因**：`markdown_to_word` 重构"末尾图表追加"逻辑时，原 `else` 分支（无图表时显示提示语）中的 `note_run` 变量被删除但引用保留，或变量作用域被破坏。
+
+**定位位置**：`src/report_builder.py` → `markdown_to_word()` 末尾 `_word_unplaced` 兜底块。
+
+**优先级**：高（Word 完全不可用）。
+
+---
+
+## 今日完成（2026-05-09）
+
+### Fix：图表导出超时（kaleido 使用系统 Chrome）
+
+**现象**：终端持续输出 `[export_chart_as_png] 超时（>120s），跳过此图表`，PDF / Word 报告中图表全部缺失。
+
+**根因**：kaleido v1.x 首次启动时通过 choreographer **自动下载 Chrome 二进制**，在网络受限环境下下载耗时 >120s，触发超时。系统已安装 Chrome，但代码从未指定路径，导致每次都走下载流程。
+
+**修复（`src/report_builder.py`）**：
+
+| 改动 | 内容 |
+|---|---|
+| `_find_system_chrome()` | 新增辅助函数，优先在 `C:\Program Files\Google\Chrome\...` 检测系统已安装的 Chrome 路径 |
+| `export_chart_as_png` 改用 `kaleido.calc_fig_sync` | 不再走 `fig.to_image()`（触发 choreographer 自动下载），直接调用 kaleido 底层 API 并传入 `kopts={"path": chrome_path}` |
+| `_kaleido_major()` | 新增版本检测，自动适配 kaleido v0（`pio.to_image`）/ v1（`calc_fig_sync`）两套 API |
+| 超时时间 120s → 30s | 使用系统 Chrome 后单张图表导出 3–5s 完成，30s 完全足够 |
+
+**同步操作**：在 Anaconda 环境执行 `pip install "kaleido>=1.0.0" --user`，升级 kaleido v0.2.1 → v1.3.0（Streamlit 运行在 Anaconda 中，必须在此环境安装）。
+
+**效果**：3 张图表各自 3–5s 内导出成功，PDF / Word 均正常嵌入图表。
+
+---
+
+### Fix + 优化：报告图表与解读文字交替排列
+
+**现象**：PDF / Word 报告中，三段图表解读文字连续输出后，三张图表再集中堆叠——即"解读1 → 解读2 → 解读3 → 图1 → 图2 → 图3"，而非期望的"解读1 → 图1 → 解读2 → 图2 → ..."。
+
+**根因**：`markdown_to_pdf` 的图表注入依赖 `_add_sec_chart()`，该函数仅在遇到下一个 `##` 标题时触发。LLM 生成的图表解读都在同一 `## 三、详细分析` 章节内（用 `###` 子标题区分），导致整章所有图表攒到最后才一起插入。
+
+**修复（`src/report_builder.py`）**：
+
+**PDF（`markdown_to_pdf`）**：
+- 新增 `_CHART_LABEL_RE` 正则，匹配 LLM 生成的 `图表1:xxx` / `图1：xxx` 格式行
+- 新增 `_inject_chart_inline(caption_hint)`：在当前位置立即注入匹配图表（PNG → reportlab `Image`）
+- 解析主循环新增 `_CHART_LABEL_RE` 分支：遇到图表标签行时——① 输出标签文字，② 消费紧跟的 `>` 解读 blockquote（含跨空行探测），③ 立即注入对应图表
+- 预计算完成后**重置 `placed` 标记**（预计算只做分组，实际注入时才设置），避免 inline 注入时找不到可用图表
+- `_add_sec_chart()` 保留为兜底：跳过已 inline 注入的图表，将未匹配的漏网图表追加到章节末
+
+**Word（`markdown_to_word`）**：
+- 新增 `_WORD_CHART_RE` 正则 + `_word_inject_chart(caption_hint)` 函数（按 caption 字符匹配得分选最优图表）
+- 同样在解析循环中检测 `图表N:` 行，消费 `>` 解读后立即嵌入图片（`doc.add_picture`）
+- 原"末尾统一追加数据图表"逻辑改为：有未匹配漏网图表时才追加到文档末尾
+
+**效果（已验证 PDF）**：
+
+```
+图表1:xxx 标签
+  图表解读:... （blockquote 缩进灰色）
+  [图1 图片]
+图表2:xxx 标签
+  图表解读:...
+  [图2 图片]
+图表3:xxx 标签
+  图表解读:...
+  [图3 图片]
+```
+
+---
+
+### 优化：饼图自动切换阈值（>5 → >12）
+
+**位置**：`src/validators.py` `validate_chart_type()`
+
+**改动**：饼图 / 环形图类别数超过阈值自动切换为横向条形图，阈值从 `>5` 放宽至 `>12`，与业界标准对齐（12 个切片以内饼图可读性尚可）。
+
+---
+
+### 依赖更新
+
+| 包 | 变更 |
+|---|---|
+| `reportlab` | 新增到 `requirements.txt`（PDF 生成必需，之前漏写）|
+| `kaleido` | Anaconda 环境 `pip install "kaleido>=1.0.0" --user` 升级至 v1.3.0 |
+
+---
+
+## 今日完成（2026-05-08）— 第二批
+
+### BugFix：PDF 生成无限挂起（7分钟以上）
+
+**现象**：生成 Word + PDF 后，界面卡在"正在生成报告，请稍候..."超过 7 分钟，无任何错误输出，进程不结束。
+
+**根因（三层叠加）**：
+
+| # | 位置 | 问题 |
+|---|---|---|
+| 1（主因）| `src/report_builder.py` `_add_sec_chart()` 第 1002 行 | 若预导出 PNG 为 `None`（超时），会回退调用 `export_chart_as_png(c['fig'])` —— 这是**无超时保护的同步 kaleido 调用**，Windows 下 kaleido subprocess 在嵌套线程上下文中会无限挂起 |
+| 2（同源）| `src/report_builder.py` 附录循环第 1139 行 | 与 1 相同的无超时 fallback 调用 |
+| 3（加剧）| `src/tools.py` `generate_report` | `markdown_to_pdf` 通过 `_doc_pool` ThreadPoolExecutor 调用，形成三层嵌套（Streamlit → `_doc_pool` → kaleido 子进程），Windows 下子进程创建死锁 |
+
+**修复（`src/report_builder.py` + `src/tools.py`）**：
+
+| 改动 | 内容 |
+|---|---|
+| `export_chart_as_png` 新增硬超时（`src/report_builder.py`）| 用独立线程 + `future.result(timeout=20)` 包裹 `fig.to_image()`；超时返回 `None`，永不阻塞调用方 |
+| 移除 `markdown_to_pdf` 内部 fallback kaleido 调用 | `_add_sec_chart()` 和附录循环均改为 `png = c.get('png')`，PNG 为 `None` 时直接跳过该图表，不再重新调用 kaleido |
+| 移除 `_doc_pool` ThreadPoolExecutor（`src/tools.py`）| `markdown_to_word` / `markdown_to_pdf` 改为直接同步调用（两者均 < 2s），消除三层嵌套；速度不损失，因为耗时的图表预导出已与 LLM 并行完成 |
+
+**效果**：报告生成从无限挂起恢复正常，总耗时 ≤ 2 分钟（LLM ≤90s + 预导出与 LLM 并行 ≈0s 额外等待 + reportlab ≈2s）。
+
+---
+
+### BugFix：多轮对话报告内容串台（核心数据隔离 Bug）
+
+**现象**：第二个问题（物流配送分析）生成的报告，"核心发现""详细分析""数据摘要"等章节输出的是第一个问题（RFM 分层分析）的内容，同时出现"你好！我是你的 AI 数据分析助手"等 greeting 消息。
+
+**根因**：`generate_report` 读取 `st.session_state.messages`（全量历史消息）和 `st.session_state.query_results`（全量历史查询）+ `chart_registry`（全量历史图表），没有"本轮"边界概念，导致所有历史轮次内容被错误合并到当前报告。
+
+**修复（`src/tools.py`）—— 三层轮次隔离**：
+
+| 数据类型 | 隔离机制 |
+|---|---|
+| **对话消息** | `_report_msg_round_start`：记录上次报告结束时的 `messages` 长度，下次取 `messages[idx:]` |
+| **查询数据** | `_round_query_intents`（列表）：`query_database` 每次调用时将 `intent` key 追加进来；`generate_report` 只取此列表内的 `query_results` |
+| **图表** | `_report_chart_round_start`：记录上次报告结束时的 `chart_registry` 长度，下次取 `chart_registry[idx:]` |
+| **轮次推进** | `generate_report` 完成后：三个指针同步更新，`_round_query_intents` 清空，下轮重新积累 |
+
+边界处理：首次报告（从未设置轮次）fallback 取全部已有 key；有轮次记录但本轮无查询时，`query_results` 为空（不回退到历史数据）。
+
+---
+
+### 优化：报告内容质量提升
+
+**优化1 — Agent 分析洞察充分融入报告**
+
+- 对话摘要字符限制 800 → **1500**，消息数量上限 8 → **12** 条
+- 新增 greeting/系统消息过滤：不含分析关键词（数据/分析/排名/占比/率/建议等）的 assistant 消息自动跳过，避免"你好！我是你的 AI 数据分析助手"等干扰内容污染报告
+- LLM prompt 强化：明确要求"深度整合 Agent 洞察（原因分析、特殊规律、业务解读），不要简单重复数字，要提炼 Agent 的解读结论"
+
+**优化2 — 图表在报告对应章节附带解读**
+
+- LLM prompt 新增图表清单块：列出本轮所有图表标题，要求"每张图表对应章节须包含 2-4 句视觉洞察解读（描述关键趋势/异常/结论），聚焦图表独有的视觉信息而非重复表格数字"
+- 轮次隔离后确保报告只嵌入本轮图表（气泡图只出现在物流报告，RFM 图表只出现在 RFM 报告）
+
+---
+
+## 今日完成（2026-05-08）— 第一批
+
+### PDF 四大专项优化
+
+#### 优化一：生成速度（5分钟 → ~30秒）
+
+**根因**：原流程串行：LLM（max 90s）→ 预导出图表（串行 25s/张）→ Word（max 30s）→ PDF（max 120s）= 最坏 4~5 分钟。
+
+**修复（`src/tools.py`）**：
+1. **LLM + 图表预导出并行**：两者互不依赖，用独立 `ThreadPoolExecutor` 同时启动；kaleido 1.x 速度极快（3 张图约 2.5s 并行完成），LLM 结果一到立即构建文档
+2. **Word + PDF 并行**：两者都依赖 LLM 输出，但互不依赖，改为同时提交到线程池，分别最多等 30s / 60s
+3. **移除旧 120s PDF 超时**：reportlab 实际 < 1s，60s 完全足够
+4. **`export_chart_as_png` 去掉内部嵌套线程**：kaleido 1.x 不需要额外线程包裹，直接调用即可（原来的双重嵌套 ThreadPoolExecutor 无意义）
+
+实测时间（本地，3 张图）：约 3s（图表导出 2.5s + reportlab 0.3s）；含 LLM 取决于 DeepSeek API，预计 30-90s 总耗时。
+
+---
+
+#### 优化二：表格列宽自动适配（`src/report_builder.py`）
+
+**根因**：原来 `col_w = avail_w / n_cols` 等宽分配，"总消费金额"、"最大消费金额"等长列内容必然换行。
+
+**修复**：实现 `_compute_col_widths` 逻辑——按每列最大内容长度估算宽度（CJK 字 ≈ 9pt，ASCII ≈ 5pt，+16pt 内边距），按比例分配，最小列宽 14mm，总宽不超版心。效果：所有列宽随内容自适应，彻底消除换行。
+
+---
+
+#### 优化三：金额千位符（`src/report_builder.py`）
+
+**实现**：在 `inline()` 函数前置 `_add_thousands()` 处理：
+- 匹配"数字元"模式：126161.70元 → **126,161.70元**
+- 匹配大整数（≥4位，含小数）：1750521.46元 → **1,750,521.46元**
+- 保护年份（1900-2099 的 4 位整数不加千位符）
+- 保护人数等计数（无小数且无"元"后缀不强制格式化）
+
+---
+
+#### 优化四：图表嵌入 PDF（`src/report_builder.py`）
+
+**根因**：章节标题"三、详细分析"与图表标题"RFM用户分层-各层级用户分布"无 bigram 交集，导致所有图表进附录；附录又因 C_BLUE NameError（今日已修）崩溃，图表完全消失。
+
+**修复**：
+1. **三级匹配新增 P3 单字兜底**：章节含分析类关键字（析/层/分/趋/比/额/率/布/统/量/增/跌/变）时，可匹配同含这些字的图表——"详细分析（析/分）"成功匹配"RFM用户分层（层/分）"
+2. **贪婪匹配**：同一章节一次性吸纳所有能匹配的图表（原来只取第一个）；RFM 场景中"详细分析"章节现在能吸纳全部 3 张图
+3. **宽高比修正**：kaleido 导出改为 960×440（scale=1.5），PDF 内的 Image 高度同步更新为 `avail_w × 440/960`
+
+实测结果：3 张 RFM 图表全部出现在"三、详细分析"正文中，不再需要翻到附录。
+
+---
+
+### BugFix：PDF 生成再次超时（NameError 被误报为"超时"）
+
+**现象**：生成含图表的 PDF 时显示"PDF 生成失败：PDF 生成超时（>120s），建议改用 Word 格式"，实际是代码崩溃而非真正超时。
+
+**根因（三个叠加）**：
+
+| # | 位置 | 问题 |
+|---|---|---|
+| 1（主因）| `src/report_builder.py` 附录块 | `C_BLUE` 颜色常量从未定义，只有 `C_BDR`；有未匹配图表进附录时触发 `NameError` |
+| 2（掩盖）| `src/tools.py` `_run_with_timeout` | `except (_cf.TimeoutError, Exception)` 把真实异常和超时一起吞掉，全都返回 `None`，导致错误信息永远是"超时" |
+| 3（潜在阻塞）| `src/tools.py` 预导出块 | 使用 `with ThreadPoolExecutor` 上下文，`__exit__` 调 `shutdown(wait=True)`，若某 future 已超时但底层线程仍在跑，会短暂阻塞主线程 |
+
+**修复（`src/report_builder.py` + `src/tools.py`）**：
+
+| 改动 | 内容 |
+|---|---|
+| `report_builder.py` 第 1064 行 | `C_BLUE` → `C_BDR`（附录分割线颜色，与其他 HR 保持一致） |
+| `_run_with_timeout` 异常处理 | 改为只 `except _cf.TimeoutError: return None`；其他异常原样抛出，让调用方的 `except Exception as e` 显示真实原因 |
+| 预导出块 | 改为手动 `_pool = ThreadPoolExecutor(...)` + `_pool.shutdown(wait=False)`，不用 `with` 上下文，避免超时 future 拖住主线程 |
+
+---
+
 ## 今日完成（2026-05-06）
 
 ### PDF 报告专项优化（PDF报告优化.md 全部任务完成）

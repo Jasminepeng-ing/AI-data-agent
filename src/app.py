@@ -395,14 +395,15 @@ def _total_agg(col_name: str, series: pd.Series):
     - 均值类（avg/score/rating 等）        → 算术平均
     - 其他数值列                           → 求和
     """
+    import math
     lower = col_name.lower()
     if any(kw in lower for kw in _RATIO_KEYWORDS):
-        return "—"
+        return float("nan")   # NaN 保持 float dtype；Styler 用 na_rep="—" 展示
     if any(kw in lower for kw in _MEDIAN_KEYWORDS):
         return round(series.median(), 4)
     if any(kw in lower for kw in _MODE_KEYWORDS):
         mode_vals = series.mode()
-        return round(mode_vals.iloc[0], 4) if len(mode_vals) > 0 else "—"
+        return round(mode_vals.iloc[0], 4) if len(mode_vals) > 0 else float("nan")
     if any(kw in lower for kw in _MAX_KEYWORDS):
         return series.max()
     if any(kw in lower for kw in _MIN_KEYWORDS):
@@ -441,16 +442,28 @@ def _render_dataframe_with_total(df: pd.DataFrame) -> None:
     )
     first_label = "合计 / 统计" if has_special_col else "合计"
 
+    # 标签优先放入第一个非数值列，避免将字符串写入数值列导致 Arrow 序列化警告
+    label_col = next((c for c in df.columns if c not in numeric_cols), None)
+
     total: dict = {}
+    label_placed = False
     for i, col in enumerate(df.columns):
-        if i == 0:
-            total[col] = first_label
+        if col == label_col:
+            total[col] = first_label   # 第一个文本列：放标签
+            label_placed = True
+        elif i == 0 and not label_placed:
+            total[col] = first_label   # 全数值列时退化为首列（保留原行为）
+            label_placed = True
         elif col in numeric_cols:
             total[col] = _total_agg(col, df[col].dropna())
         else:
             total[col] = "—"
     total_df  = pd.DataFrame([total])
     combined  = pd.concat([df, total_df], ignore_index=True)
+
+    # 若标签只能放在数值列（全数值 df），显式转 object 防止 Arrow 推断 int64 后报错
+    if label_col is None:
+        combined[df.columns[0]] = combined[df.columns[0]].astype(object)
 
     def _style_total(frame: pd.DataFrame) -> pd.DataFrame:
         styles = pd.DataFrame("", index=frame.index, columns=frame.columns)

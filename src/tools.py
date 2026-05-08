@@ -566,6 +566,12 @@ def query_database(sql: str, intent: str, ds) -> str:
         }
         st.session_state.latest_query_key = intent
 
+        # 记录本轮新增的 intent key（供 generate_report 隔离轮次）
+        if "_round_query_intents" not in st.session_state:
+            st.session_state["_round_query_intents"] = []
+        if intent not in st.session_state["_round_query_intents"]:
+            st.session_state["_round_query_intents"].append(intent)
+
         MAX_FULL_ROWS = 100
         if df.empty:
             data_text = "（查询返回空结果）"
@@ -1159,19 +1165,40 @@ def generate_report(
     """
     import concurrent.futures as _cf
 
-    # ── Step 1: 收集本轮分析内容 ────────────────────────────────────────────────
-    messages      = st.session_state.get("messages", [])
-    query_results = st.session_state.get("query_results", {})
+    # ── Step 1: 收集本轮分析内容（仅当前轮次，不含历史轮次内容）────────────────────
+    all_messages  = st.session_state.get("messages", [])
+    all_query_results = st.session_state.get("query_results", {})
 
-    # 取 assistant 的文字回答，每条限 800 字，最多 8 条
+    # ── 轮次边界（每次 generate_report 完成后更新，隔离多轮对话）────────────────────
+    _msg_round_start   = st.session_state.get("_report_msg_round_start", 0)
+    _chart_round_start = st.session_state.get("_report_chart_round_start", 0)
+    # 若从未设置（会话第一次），取全部已有 keys；
+    # 若已设置（正常轮次），使用本轮积累的 keys（可以为空，代表本轮无新查询）
+    _raw_round_intents = st.session_state.get("_round_query_intents", None)
+    _round_query_intents = list(all_query_results.keys()) if _raw_round_intents is None else _raw_round_intents
+
+    # 只取本轮消息（上次报告结束后到现在）
+    messages = all_messages[_msg_round_start:]
+
+    # 只取本轮查询结果
+    query_results = {k: v for k, v in all_query_results.items() if k in _round_query_intents}
+
+    # 取 assistant 的文字回答（本轮），每条限 1500 字，最多 12 条
+    # 过滤掉纯 greeting/系统消息（无实质分析内容）
     conversation_summary = []
     for msg in messages:
         if msg.get("role") == "assistant" and msg.get("content"):
-            txt = msg["content"]
-            if len(txt) > 800:
-                txt = txt[:800] + "…"
+            txt = msg["content"].strip()
+            # 跳过纯问候/系统消息（不含任何数字或关键分析词）
+            _analysis_keywords = ("数据", "分析", "查询", "结果", "发现", "建议", "统计",
+                                  "占比", "排名", "平均", "总计", "比例", "率", "图表",
+                                  "%", "天", "元", "次", "个")
+            if not any(kw in txt for kw in _analysis_keywords):
+                continue
+            if len(txt) > 1500:
+                txt = txt[:1500] + "…"
             conversation_summary.append(txt)
-    conversation_summary = conversation_summary[-8:]
+    conversation_summary = conversation_summary[-12:]
 
     def _detect_preview_rows(info: dict, default: int = 30) -> int:
         """
@@ -1264,17 +1291,32 @@ def generate_report(
             "\n\n=== 原始查询数据（报告所有数字必须严格来自此处，禁止自行推算）===\n"
             + "\n\n---\n".join(data_summaries)
         ) if data_summaries else ""
+        # 图表说明：告知 LLM 报告中将嵌入哪些图表，让其在对应章节留出解读文字
+        chart_note = ""
+        if captions:
+            chart_list = "\n".join(f"  - 图表 {i+1}：{cap}" for i, cap in enumerate(captions))
+            chart_note = (
+                f"\n\n=== 本轮图表清单（共 {len(captions)} 张，将自动嵌入报告对应章节）===\n"
+                f"{chart_list}\n"
+                "⚠️ 报告中每张图表对应章节须包含 2-4 句图表解读文字（描述关键趋势/异常/结论），"
+                "不要重复数字表格已有的内容，聚焦图表独有的视觉洞察。"
+            )
+
         prompt = (
             f"请用 Markdown 格式（# 一级标题 ## 二级标题）撰写一份面向【{audience_desc}】的分析报告。\n"
             f"报告标题：{report_title}\n章节要求：{sections_str}\n\n"
-            "⚠️ 数据保真规则（最高优先级）：\n"
-            "1. 报告中出现的每一个数字必须与下方「原始查询数据」完全一致，不得四舍五入到不同精度；\n"
-            "2. 禁止对已有列进行二次计算（如用 A/B 推算新指标），如果所需指标列已存在则直接引用；\n"
-            "3. 如果某个指标在数据中不存在，请在报告中注明「(数据中无此项)」，不得推断或估算；\n"
-            "4. 表格中每一个单元格的数字都必须能在下方数据中找到原始依据。\n\n"
-            f"=== 本轮分析对话摘要 ===\n" + "\n\n".join(conversation_summary) +
-            data_block +
-            "\n\n其他要求：语言专业简洁，关键结论加粗，表格使用 Markdown 格式，建议部分具体可执行。"
+            "⚠️ 核心规则（按优先级）：\n"
+            "1. 【数据保真】报告所有数字必须严格来自下方原始查询数据，禁止推算或编造；\n"
+            "2. 【内容充实】下方「对话摘要」包含 Agent 的完整分析洞察，"
+            "报告须深度整合这些洞察（包括原因分析、特殊规律、业务解读），"
+            "不要简单重复数字，要提炼 Agent 的解读结论；\n"
+            "3. 【避免重复】同一信息只出现一次，表格展示数据则文字段落聚焦解读而非罗列数字；\n"
+            "4. 【禁止串台】严格只报告本次分析主题的内容，不引用其他主题的数据或结论。\n\n"
+            f"=== 本轮 Agent 分析对话（核心分析内容来源，须充分融入报告）===\n"
+            + "\n\n---\n".join(conversation_summary)
+            + data_block
+            + chart_note
+            + "\n\n其他要求：语言专业简洁，关键结论加粗，表格使用 Markdown 格式，建议部分具体可执行。"
         )
         client = OpenAI(
             api_key=DEEPSEEK_API_KEY,
@@ -1302,7 +1344,8 @@ def generate_report(
     def _run_with_timeout(fn, timeout_sec):
         """
         在独立线程执行 fn()，最多等待 timeout_sec 秒。
-        超时后立即返回 None 并以 wait=False 释放线程（不阻塞主线程）。
+        - 超时：返回 None
+        - 其他异常：原样抛出（让调用方显示真实错误信息）
         注意：不能用 `with ThreadPoolExecutor` —— 其 __exit__ 调用 shutdown(wait=True)，
         会一直等线程结束，导致界面卡死。
         """
@@ -1310,30 +1353,62 @@ def generate_report(
         _f  = _ex.submit(fn)
         try:
             return _f.result(timeout=timeout_sec)
-        except (_cf.TimeoutError, Exception):
-            return None
+        except _cf.TimeoutError:
+            return None   # 只有真实超时才返回 None
         finally:
             _ex.shutdown(wait=False)   # 立即释放，不等后台线程
 
-    # 先尝试 LLM（90s），超时或失败则 fallback 编译
-    content  = _run_with_timeout(_llm_report, 90)
-    used_llm = bool(content)
-    if not content:
-        content = _compile_report()
-
-    # ── Step 3: 根据 output_format 生成输出，存入 session_state ─────────────────
-    # 支持 "all" / "markdown" / "word" / "pdf" / "word+pdf" 等复合格式
+    # ── Step 3 准备：收集图表（与 LLM 并行预导出，互不依赖）──────────────────────
     if output_format == "all":
         _fmts = {"markdown", "word", "pdf"}
     else:
         _fmts = set(output_format.replace(",", "+").split("+"))
 
-    # 始终收集本轮图表（embed_charts 控制是否传给 build_html_report，PDF 始终嵌入）
-    chart_reg = st.session_state.get("chart_registry", [])
-    valid_charts = [item for item in chart_reg if item.get("fig") is not None]
-    figures  = [item["fig"]     for item in valid_charts]
-    captions = [item["caption"] for item in valid_charts]
+    # 只取本轮图表（_chart_round_start 之后追加的）
+    all_chart_reg = st.session_state.get("chart_registry", [])
+    chart_reg     = all_chart_reg[_chart_round_start:]
+    valid_charts  = [item for item in chart_reg if item.get("fig") is not None]
+    figures       = [item["fig"]     for item in valid_charts]
+    captions      = [item["caption"] for item in valid_charts]
 
+    # ── 并行策略：LLM 放后台线程，图表导出在当前线程直接调用 ────────────────────
+    # Windows 下 kaleido 子进程在 ThreadPoolExecutor worker 线程中启动不稳定（嵌套
+    # 线程 + spawn 进程死锁）。把 fig.to_image() 留在 Streamlit script-runner 线程
+    # 直接调用可彻底消除该问题；LLM 调用放后台线程实现并行，不影响总耗时。
+    need_png = ("pdf" in _fmts or "word" in _fmts) and bool(figures)
+
+    # 启动 LLM 后台线程
+    _llm_pool   = _cf.ThreadPoolExecutor(max_workers=1)
+    _llm_future = _llm_pool.submit(_llm_report)
+
+    # 在当前线程导出图表（与 LLM 真正并行）
+    _png_bytes_list: list = []
+    if need_png:
+        print(f"[generate_report] 开始导出 {len(figures)} 张图表 PNG ...")
+        for _i, _fig in enumerate(figures):
+            try:
+                _png = report_builder.export_chart_as_png(_fig)
+                _png_bytes_list.append(_png)
+                _sz  = len(_png) if _png else 0
+                print(f"[generate_report] 图表{_i+1}/{len(figures)}: {'OK' if _png else 'FAILED'} size={_sz}")
+            except Exception as _e:
+                print(f"[generate_report] 图表{_i+1} 导出异常: {_e}")
+                _png_bytes_list.append(None)
+        _ok = sum(1 for p in _png_bytes_list if p)
+        print(f"[generate_report] PNG 导出完成：{_ok}/{len(figures)} 成功")
+
+    # 等待 LLM 结果（最多 90s）
+    try:
+        content = _llm_future.result(timeout=90)
+    except Exception:
+        content = None
+    _llm_pool.shutdown(wait=False)
+
+    used_llm = bool(content)
+    if not content:
+        content = _compile_report()
+
+    # ── Step 3: 直接生成 Word + PDF（预导出已并行完成，此处直接调用无嵌套线程问题）──
     report_output = {
         "title":         report_title,
         "content":       content,
@@ -1343,41 +1418,31 @@ def generate_report(
         "chart_count":   len(figures),
     }
 
-    # Word 生成（30s 超时）
+    # Word 直接调用（< 2s，无需线程池）
     if "word" in _fmts:
-        def _make_word():
-            return report_builder.markdown_to_word(content, report_title)
-        result = _run_with_timeout(_make_word, 30)
-        if result is not None:
-            report_output["word_bytes"] = result
-        else:
-            report_output["word_error"] = "Word 生成超时（>30s），请重试"
-
-    # PDF 生成（120s 超时）
-    # 先并行预导出所有图表 PNG（每张最多 25s，并行执行），再传给 markdown_to_pdf
-    # 避免串行导出 N 张图累计超时：3 张 × 25s = 75s > 旧上限 60s
-    if "pdf" in _fmts:
-        _png_bytes_list: list = []
-        if figures:
-            with _cf.ThreadPoolExecutor(max_workers=min(len(figures), 4)) as _pool:
-                _futures = [_pool.submit(report_builder.export_chart_as_png, fig) for fig in figures]
-                for _fut in _futures:
-                    try:
-                        _png_bytes_list.append(_fut.result(timeout=28))
-                    except Exception:
-                        _png_bytes_list.append(None)
-
-        def _make_pdf():
-            return report_builder.markdown_to_pdf(
-                content, report_title, figures, captions,
-                chart_png_bytes=_png_bytes_list or None,
-            )
         try:
-            result = _run_with_timeout(_make_pdf, 120)
+            _png_arg = _png_bytes_list if _png_bytes_list else None
+            result = report_builder.markdown_to_word(
+                content, report_title, captions, _png_arg
+            )
+            if result is not None:
+                report_output["word_bytes"] = result
+            else:
+                report_output["word_error"] = "Word 生成返回空结果，请重试"
+        except Exception as e:
+            report_output["word_error"] = f"Word 生成失败: {e}"
+
+    # PDF 直接调用（预导出 PNG 已就绪，reportlab 渲染 < 2s，无需线程池）
+    if "pdf" in _fmts:
+        try:
+            _png_arg = _png_bytes_list if _png_bytes_list else None
+            result = report_builder.markdown_to_pdf(
+                content, report_title, figures, captions, _png_arg
+            )
             if result is not None:
                 report_output["pdf_bytes"] = result
             else:
-                report_output["pdf_error"] = "PDF 生成超时（>120s），建议改用 Word 格式"
+                report_output["pdf_error"] = "PDF 生成返回空结果，请重试"
         except Exception as e:
             report_output["pdf_error"] = f"PDF 生成失败: {e}"
 
@@ -1385,6 +1450,11 @@ def generate_report(
     if "_report_output" not in st.session_state:
         st.session_state["_report_output"] = []
     st.session_state["_report_output"].append(report_output)
+
+    # ── 推进轮次边界（下一轮报告只收集此次之后的新内容）──────────────────────────
+    st.session_state["_report_msg_round_start"]   = len(all_messages)
+    st.session_state["_report_chart_round_start"] = len(all_chart_reg)
+    st.session_state["_round_query_intents"]      = []  # 清空，下轮重新积累
 
     # 返回给 LLM 的摘要（告知报告已就绪，禁止 LLM 再重复输出报告全文）
     word_ok = "word_bytes" in report_output

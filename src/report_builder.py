@@ -20,12 +20,17 @@ from datetime import datetime
 
 # ── 函数 1: markdown_to_word ─────────────────────────────────────────────────
 
-def markdown_to_word(markdown_content: str, title: str) -> bytes:
+def markdown_to_word(
+    markdown_content: str,
+    title: str,
+    chart_captions: list = None,
+    chart_png_bytes: list = None,
+) -> bytes:
     """
     把 Markdown 字符串转成格式化的 Word 文档，返回 bytes。
 
-    支持：一/二/三级标题、正文、加粗、项目符号、Markdown 表格、水平线
-    不嵌入图表（Word 末尾加注说明）
+    支持：一/二/三级标题、正文、加粗、项目符号、Markdown 表格、水平线、图表嵌入
+    chart_captions / chart_png_bytes 均传入时在报告末尾追加图表截图。
     """
     from docx import Document
     from docx.shared import Pt, Cm, RGBColor
@@ -124,6 +129,39 @@ def markdown_to_word(markdown_content: str, title: str) -> bytes:
     # ── 按行解析 Markdown ─────────────────────────────────────────────────────
     lines = markdown_content.splitlines()
     i = 0
+    _WORD_CHART_RE = re.compile(r'^图表?\s*\d+\s*[：:]')
+    _word_unplaced = list(zip(chart_captions or [], chart_png_bytes or []))
+    _word_chart_idx = [0]   # 当前待放置图表下标（顺序兜底）
+
+    def _word_inject_chart(caption_hint: str):
+        """在 Word 当前位置嵌入一张与 caption_hint 最匹配的图表。"""
+        if not _word_unplaced:
+            return
+        # 简单匹配：找 caption 与 hint 共同字符数最多的
+        best_idx, best_score = 0, -1
+        for wi, (cap, png) in enumerate(_word_unplaced):
+            if png is None:
+                continue
+            score = sum(1 for ch in caption_hint if ch in cap)
+            if score > best_score:
+                best_score, best_idx = score, wi
+        cap, png = _word_unplaced.pop(best_idx)
+        if png is None:
+            return
+        doc.add_paragraph()
+        try:
+            pic_para = doc.add_paragraph()
+            pic_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            pic_para.add_run().add_picture(BytesIO(png), width=Cm(15))
+        except Exception:
+            pass
+        cap_para = doc.add_paragraph()
+        cap_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        cap_run = cap_para.add_run(f"图: {cap}")
+        cap_run.font.size = Pt(9)
+        cap_run.font.italic = True
+        cap_run.font.color.rgb = RGBColor(0x6B, 0x72, 0x80)
+
     while i < len(lines):
         line = lines[i]
 
@@ -224,6 +262,37 @@ def markdown_to_word(markdown_content: str, title: str) -> bytes:
                 run.font.size = Pt(11)
             i += 1; continue
 
+        # 图表标签行（如 "图表1:xxx"）—— 先输出标签文字，再消费 > 解读块，最后内联插图
+        if _WORD_CHART_RE.match(line.strip()):
+            _para(line.strip(), size=11, space_before=4, space_after=2)
+            i += 1
+            # 消费 > blockquote 行：遇空行时探测前方，若仍有 > 则继续
+            while i < len(lines):
+                bq = lines[i].strip()
+                if bq.startswith('>'):
+                    _para(bq.lstrip('>').strip(), size=10, space_before=0,
+                          space_after=3, color=(75, 85, 99))
+                    i += 1
+                elif bq == '':
+                    j = i + 1
+                    while j < len(lines) and lines[j].strip() == '':
+                        j += 1
+                    if j < len(lines) and lines[j].strip().startswith('>'):
+                        i += 1   # 跳过中间空行继续
+                    else:
+                        break
+                else:
+                    break
+            caption_hint = _WORD_CHART_RE.sub('', line.strip()).strip()
+            _word_inject_chart(caption_hint)
+            continue
+
+        # blockquote（> 行，非图表标签后的独立解读）
+        if line.strip().startswith('>'):
+            _para(line.strip().lstrip('>').strip(), size=10, space_before=0,
+                  space_after=3, color=(75, 85, 99))
+            i += 1; continue
+
         # 空行
         if not line.strip():
             i += 1; continue
@@ -232,15 +301,28 @@ def markdown_to_word(markdown_content: str, title: str) -> bytes:
         _para(line, size=11, space_before=0, space_after=4)
         i += 1
 
-    # ── 末尾注释：图表说明 ────────────────────────────────────────────────────
-    doc.add_paragraph()
-    _add_hr(doc)
-    note = doc.add_paragraph()
-    note.paragraph_format.space_before = Pt(6)
-    note_run = note.add_run("📊 本报告图表请在 AI Agent 界面查看（Word 格式不支持交互式图表）")
-    note_run.font.size = Pt(9)
-    note_run.font.italic = True
-    note_run.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
+    # ── 未匹配图表兜底：追加到末尾 ───────────────────────────────────────────
+    if _word_unplaced and any(png for _, png in _word_unplaced):
+        doc.add_paragraph()
+        _add_hr(doc)
+        for cap, png in _word_unplaced:
+            if png is None:
+                continue
+            doc.add_paragraph()
+            try:
+                pic_para = doc.add_paragraph()
+                pic_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                pic_para.add_run().add_picture(BytesIO(png), width=Cm(15))
+            except Exception:
+                pass
+            cap_para = doc.add_paragraph()
+            cap_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            cap_run = cap_para.add_run(f"图: {cap}")
+            cap_run.font.size = Pt(9)
+            cap_run.font.italic = True
+            cap_run.font.color.rgb = RGBColor(0x6B, 0x72, 0x80)
+        note_run.font.italic = True
+        note_run.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
 
     buf = BytesIO()
     doc.save(buf)
@@ -249,34 +331,75 @@ def markdown_to_word(markdown_content: str, title: str) -> bytes:
 
 # ── 函数 2: export_chart_as_png ─────────────────────────────────────────────
 
-_PNG_TIMEOUT_SEC = 25  # kaleido 首次启动 Chromium 可能很慢，超时则跳过
+_SYSTEM_CHROME_PATHS = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+]
 
-def export_chart_as_png(fig, width: int = 1100, height: int = 500) -> bytes | None:
-    """
-    把 Plotly Figure 导出为 PNG bytes（需要 kaleido）。
-    默认 scale=2，实际像素 2200×1000，满足 A4 高清打印。
-    - 找不到 kaleido 或超时（25 秒）时返回 None，不报错，报告继续生成。
-    - 用独立线程执行，防止 kaleido 启动 Chromium 时阻塞主线程。
-    """
-    import concurrent.futures
+def _find_system_chrome() -> str | None:
+    """返回系统 Chrome 可执行文件路径，未找到返回 None。"""
+    import os
+    for p in _SYSTEM_CHROME_PATHS:
+        if os.path.isfile(p):
+            return p
+    return None
 
-    def _do_export():
-        return fig.to_image(format="png", width=width, height=height, scale=2)
 
-    # 不用 `with ThreadPoolExecutor` —— 其 __exit__ 调用 shutdown(wait=True)，
-    # 超时后仍会阻塞等 kaleido 线程结束。改为手动 shutdown(wait=False)。
-    _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    _f  = _ex.submit(_do_export)
+def _kaleido_major() -> int:
+    """返回已安装 kaleido 的主版本号（0 或 1）。"""
     try:
-        return _f.result(timeout=_PNG_TIMEOUT_SEC)
-    except concurrent.futures.TimeoutError:
-        print(f"[report_builder] chart export timed out after {_PNG_TIMEOUT_SEC}s, skipping")
-        return None
-    except Exception as e:
-        print(f"[report_builder] chart export failed: {e}")
-        return None
-    finally:
-        _ex.shutdown(wait=False)
+        import importlib.metadata
+        ver = importlib.metadata.version("kaleido")
+        return int(ver.split(".")[0])
+    except Exception:
+        return 0
+
+
+def export_chart_as_png(fig, width: int = 960, height: int = 440,
+                        timeout: int = 30) -> bytes | None:
+    """
+    把 Plotly Figure 导出为 PNG bytes，自动适配 kaleido v0 / v1。
+
+    - kaleido v1: 用 calc_fig_sync + 系统 Chrome 路径（跳过 choreographer 自动下载）
+    - kaleido v0: 用 plotly.io.to_image（内置可执行文件，不需要 Chrome）
+    用 daemon 线程 + threading.Event 保护，超时返回 None，永不阻塞调用方。
+    """
+    import threading
+
+    ver = _kaleido_major()
+    chrome_path = _find_system_chrome()
+    print(f"[export_chart_as_png] kaleido v{ver}, Chrome={chrome_path or 'N/A'}")
+
+    result = [None]
+    done   = threading.Event()
+
+    def _worker():
+        try:
+            if ver >= 1:
+                import kaleido as _kaleido
+                fig_dict = fig.to_dict()
+                kopts = {"path": chrome_path} if chrome_path else {}
+                result[0] = _kaleido.calc_fig_sync(
+                    fig_dict,
+                    opts={"format": "png", "width": width, "height": height, "scale": 1.5},
+                    kopts=kopts,
+                )
+            else:
+                # kaleido v0: use plotly's built-in to_image
+                import plotly.io as pio
+                result[0] = pio.to_image(fig, format="png", width=width, height=height, scale=1.5)
+            print(f"[export_chart_as_png] 成功 size={len(result[0])} bytes")
+        except Exception as e:
+            print(f"[export_chart_as_png] 异常: {e}")
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    if done.wait(timeout=timeout):
+        return result[0]
+    print(f"[export_chart_as_png] 超时（>{timeout}s），跳过此图表")
+    return None
 
 
 # ── 函数 3: build_html_report ────────────────────────────────────────────────
@@ -508,38 +631,51 @@ def _chart_html(chart_n: int, b64: str, caption: str) -> str:
 
 def _match_chart_for_section(section_title: str, unplaced: list) -> dict | None:
     """
-    按两级优先级为章节标题匹配最合适的图表。
-    优先级1：图表标题包含章节关键词（bigram 或英文词）。
-    优先级2：章节与图表标题的 bigram 集合有交集。
-    匹配到后将 chart dict 的 'placed' 设为 True 并返回。
+    三级优先级为章节标题匹配图表。
+    P1: 图表标题直接包含章节关键词（bigram / 英文词）。
+    P2: 章节与图表标题 bigram 集合有交集。
+    P3: 分析类单字兜底（析/层/分/趋/比/额/率/布）——解决"三、详细分析" vs "用户分层" 等典型不匹配。
     """
+    # 分析类关键单字：出现在这些字的章节可以接纳任何分析图表
+    _ANALYSIS_CH = frozenset('析层分趋比额率布统量增跌变')
+
     def keywords(s: str) -> set:
-        """提取关键词：汉字连续串的所有 2-gram + 3字以上英文词。"""
         result = set()
-        # 英文词（3字以上）
         for w in re.findall(r'[a-zA-Z]{3,}', s):
             result.add(w.lower())
-        # 汉字连续串 → 逐个 2-gram
         for run in re.findall(r'[一-鿿]+', s):
             for i in range(len(run) - 1):
                 result.add(run[i:i + 2])
         return result
 
     sec_kw = keywords(section_title)
-    if not sec_kw:
-        return None
+    sec_ch = set(re.findall(r'[一-鿿]', section_title))
 
-    # 优先级 1：图表标题作为字符串直接包含章节中的某个关键词
+    # P1: 直接字符串包含
     for c in unplaced:
-        for w in sec_kw:
-            if w in c['caption']:
+        if not c.get('placed'):
+            for w in sec_kw:
+                if len(w) >= 2 and w in c['caption']:
+                    c['placed'] = True
+                    return c
+
+    # P2: bigram 集合交集
+    for c in unplaced:
+        if not c.get('placed'):
+            if sec_kw & keywords(c['caption']):
                 c['placed'] = True
                 return c
-    # 优先级 2：关键词集合有交集
-    for c in unplaced:
-        if sec_kw & keywords(c['caption']):
-            c['placed'] = True
-            return c
+
+    # P3: 分析类单字兜底（章节含分析类字 AND 图表也含分析类字）
+    sec_analysis = sec_ch & _ANALYSIS_CH
+    if sec_analysis:
+        for c in unplaced:
+            if not c.get('placed'):
+                cap_ch = set(re.findall(r'[一-鿿]', c['caption']))
+                if sec_analysis & cap_ch & _ANALYSIS_CH:
+                    c['placed'] = True
+                    return c
+
     return None
 
 
@@ -870,8 +1006,54 @@ def markdown_to_pdf(
     if not _is_yahe:
         _SYM_MAP.update(_SYM_FALLBACK)
 
+    # ── 千位符：匹配数字（可带小数）后紧跟"元"，或整数部分 ≥ 4 位的金额数字 ──
+    _MONEY_RE = re.compile(
+        r'(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)'   # 数字（含已有逗号）
+        r'(?=\s*元)'                                           # 后接"元"
+    )
+    _LARGE_INT_RE = re.compile(r'\b(\d{4,})(\.\d+)?\b')     # ≥4位整数（不跟年份检测）
+
+    def _fmt_num(m: re.Match) -> str:
+        """给数字加千位符。"""
+        raw = m.group(1).replace(',', '')
+        dec  = m.group(2) or ''
+        try:
+            n = int(raw)
+            return f"{n:,}{dec}"
+        except ValueError:
+            return m.group(0)
+
+    def _add_thousands(text: str) -> str:
+        """对"数字+元"和独立大整数（≥1000，含小数）添加千位符。"""
+        # 先处理"数字元"
+        def _repl_yuan(m):
+            raw = m.group(1).replace(',', '')
+            try:
+                if '.' in raw:
+                    ip, dp = raw.split('.', 1)
+                    return f"{int(ip):,}.{dp}"
+                return f"{int(raw):,}"
+            except ValueError:
+                return m.group(0)
+        text = _MONEY_RE.sub(_repl_yuan, text)
+        # 再处理独立大数（≥4位整数，且不像年份：不匹配 1900-2099 四位纯整数）
+        def _repl_large(m):
+            raw, dec = m.group(1), m.group(2) or ''
+            if len(raw) == 4 and 1900 <= int(raw) <= 2099:
+                return m.group(0)  # 年份不加千位符
+            try:
+                n = int(raw)
+                if n < 1000:
+                    return m.group(0)
+                return f"{n:,}{dec}"
+            except ValueError:
+                return m.group(0)
+        text = _LARGE_INT_RE.sub(_repl_large, text)
+        return text
+
     def inline(text: str) -> str:
-        """XML 转义 + 符号规范化 + **bold** → <b>。"""
+        """千位符 + XML 转义 + 符号规范化 + **bold** → <b>。"""
+        text = _add_thousands(text)
         for src, dst in _SYM_MAP.items():
             text = text.replace(src, dst)
         text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -927,36 +1109,76 @@ def markdown_to_pdf(
     _chart_figs  = chart_figures   or []
     _chart_caps  = chart_captions  or []
     _chart_bytes = chart_png_bytes or [None] * len(_chart_figs)
+    _ok_pngs = sum(1 for b in _chart_bytes if b is not None)
+    print(f"[markdown_to_pdf] 收到图表: {len(_chart_figs)} 张, PNG 有效: {_ok_pngs}/{len(_chart_bytes)}")
     _pdf_charts  = [
         {'caption': cap, 'fig': fig, 'png': png, 'placed': False}
         for fig, cap, png in zip(_chart_figs, _chart_caps, _chart_bytes)
     ]
     _sec_titles = re.findall(r'^## +(.+)$', markdown_content, re.MULTILINE)
-    _sec_chart_map = {}
+    print(f"[markdown_to_pdf] 报告章节(##): {_sec_titles}")
+    # _sec_chart_map: section_idx → list[chart_dict]，一个章节可嵌入多张图
+    _sec_chart_map: dict = {}
     for _si, _st in enumerate(_sec_titles):
-        _candidates = [c for c in _pdf_charts if not c['placed']]
-        _mc = _match_chart_for_section(_st, _candidates)
-        if _mc:
-            _sec_chart_map[_si] = _mc
-    _cur_sec = [-1]  # list 让闭包内可修改
+        # 贪婪匹配：一直取，直到没有新匹配（同一章节可放多张相关图）
+        while True:
+            _candidates = [c for c in _pdf_charts if not c['placed']]
+            if not _candidates:
+                break
+            _mc = _match_chart_for_section(_st, _candidates)
+            if not _mc:
+                break
+            _mc['placed'] = True  # 防止同一图表被重复匹配到多个章节
+            _sec_chart_map.setdefault(_si, []).append(_mc)
+    for _si, _st in enumerate(_sec_titles):
+        _matched = [c['caption'] for c in _sec_chart_map.get(_si, [])]
+        print(f"[markdown_to_pdf] 章节[{_si}]'{_st}' → 匹配图表: {_matched or '无'}")
+    print(f"[markdown_to_pdf] 未匹配图表（进附录）: {[c['caption'] for c in _pdf_charts if not c['placed']] or '无'}")
+    # 预计算只做分组，inline 注入时才真正设置 placed；重置标记供正式排版使用
+    for _c in _pdf_charts:
+        _c['placed'] = False
+    _cur_sec = [-1]
+
+    # 图表解读行正则：匹配 "图表1:" / "图1：" / "图表 2:" 等写法
+    _CHART_LABEL_RE = re.compile(r'^图表?\s*\d+\s*[：:]')
+
+    def _inject_chart_inline(caption_hint: str):
+        """匹配并立即注入一张图表（inline 模式，图表解读后插入）。"""
+        from reportlab.platypus import Image as _RLImage
+        candidates = [c for c in _pdf_charts if not c.get('placed')]
+        if not candidates:
+            return
+        matched = _match_chart_for_section(caption_hint, candidates)
+        if matched is None:
+            matched = candidates[0]          # 兜底：取第一张未放置的
+        matched['placed'] = True
+        png = matched.get('png')
+        if png:
+            story.append(Spacer(1, 6 * pt))
+            story.append(_RLImage(BytesIO(png), width=avail_w, height=avail_w * 440 / 960))
+            story.append(Paragraph(f"图: {inline(matched['caption'])}", s_date))
+            story.append(Spacer(1, 8 * pt))
 
     def _add_sec_chart():
-        """把当前章节匹配的图表插入 story；无可用图表或导出失败时直接跳过。"""
+        """把当前章节仍未放置的匹配图表兜底插入 story（fallback）。"""
         idx = _cur_sec[0]
         if idx < 0:
             return
-        c = _sec_chart_map.get(idx)
-        if c is None:
+        charts_for_sec = _sec_chart_map.get(idx)
+        if not charts_for_sec:
             return
-        png = c.get('png') or export_chart_as_png(c['fig'])
-        if png is None:
-            return
-        c['png'] = png  # 缓存，避免重复导出
         from reportlab.platypus import Image as _RLImage
-        story.append(Spacer(1, 6 * pt))
-        story.append(_RLImage(BytesIO(png), width=avail_w, height=avail_w * 500 / 1100))
-        story.append(Paragraph(f"图: {c['caption']}", s_date))
-        story.append(Spacer(1, 8 * pt))
+        for c in charts_for_sec:
+            if c.get('placed'):              # inline 已放置则跳过
+                continue
+            png = c.get('png')
+            if png is None:
+                continue
+            c['placed'] = True
+            story.append(Spacer(1, 6 * pt))
+            story.append(_RLImage(BytesIO(png), width=avail_w, height=avail_w * 440 / 960))
+            story.append(Paragraph(f"图: {inline(c['caption'])}", s_date))
+            story.append(Spacer(1, 8 * pt))
 
     while i < len(lines):
         line     = lines[i]
@@ -1016,12 +1238,35 @@ def markdown_to_pdf(
                 for row in raw_data:
                     while len(row) < n_cols:
                         row.append("")
-                col_w = avail_w / n_cols
+
+                # ── 自动列宽：按内容长度比例分配，避免换行 ────────────────────
+                # 估算：CJK 字符宽 ≈ 字号 pt；ASCII/数字 ≈ 字号 × 0.55 pt；每列加 16pt 内边距
+                _fs = 9  # 表格字号
+                def _est_w(text: str) -> float:
+                    cjk = sum(1 for ch in text if '一' <= ch <= '鿿' or '　' <= ch <= '〿')
+                    asc = len(text) - cjk
+                    return cjk * _fs + asc * _fs * 0.55 + 16  # +16 为左右内边距
+
+                max_ws = [0.0] * n_cols
+                for row in raw_data:
+                    for ci, cell in enumerate(row):
+                        # 先格式化再量宽（千位符会增加字符）
+                        max_ws[ci] = max(max_ws[ci], _est_w(_add_thousands(cell)))
+
+                total_est = sum(max_ws) or 1
+                # 按比例分配，最小列宽 14mm，总宽不超 avail_w
+                _14mm = 14 * mm
+                col_widths = [max(w / total_est * avail_w, _14mm) for w in max_ws]
+                # 如果等比超出，等比缩放
+                if sum(col_widths) > avail_w:
+                    scale = avail_w / sum(col_widths)
+                    col_widths = [w * scale for w in col_widths]
+
                 pdf_data = []
                 for ri, row in enumerate(raw_data):
                     sty = s_hcell if ri == 0 else s_cell
                     pdf_data.append([Paragraph(inline(c), sty) for c in row])
-                t = Table(pdf_data, colWidths=[col_w] * n_cols, repeatRows=1)
+                t = Table(pdf_data, colWidths=col_widths, repeatRows=1)
                 ts = [
                     # 表头：深海蓝背景 + 白色文字（对齐 HTML）
                     ("BACKGROUND",    (0, 0),  (-1, 0),  C_NAVY),
@@ -1043,6 +1288,33 @@ def markdown_to_pdf(
                 story.append(t)
                 story.append(Spacer(1, 8*pt))
 
+        elif _CHART_LABEL_RE.match(stripped):
+            # ── 图表标签行（如 "图表1:xxx"）: 先输出标签，再消费 > 解读块，最后注入图表
+            story.append(Paragraph(inline(stripped), s_body))
+            i += 1
+            s_bq = S("BQ", fontSize=10, textColor=HexColor("#4B5563"),
+                     leftIndent=14*pt, spaceAfter=4*pt, leading=17)
+            # 消费 blockquote：遇到空行时向前探测，若下一非空行仍是 > 则继续
+            while i < len(lines):
+                bq = lines[i].strip()
+                if bq.startswith('>'):
+                    story.append(Paragraph(inline(bq.lstrip('>').strip()), s_bq))
+                    i += 1
+                elif bq == "":
+                    # 向前探测：下一个非空行是否还是 > ?
+                    j = i + 1
+                    while j < len(lines) and lines[j].strip() == "":
+                        j += 1
+                    if j < len(lines) and lines[j].strip().startswith('>'):
+                        i += 1   # 跳过中间空行，继续消费 blockquote
+                    else:
+                        break    # 后面没有 blockquote 了，退出
+                else:
+                    break
+            # 解读文字输出完毕，紧跟注入图表
+            caption_hint = _CHART_LABEL_RE.sub('', stripped).strip()
+            _inject_chart_inline(caption_hint)
+
         elif stripped == "":
             story.append(Spacer(1, 3*pt))
             i += 1
@@ -1061,13 +1333,13 @@ def markdown_to_pdf(
         story.append(HRFlowable(width="100%", thickness=1, color=C_BDR))
         story.append(Spacer(1, 4 * pt))
         story.append(Paragraph("附图", s_h1))
-        story.append(HRFlowable(width="100%", thickness=0.5, color=C_BLUE, spaceAfter=4 * pt))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=C_BDR, spaceAfter=4 * pt))
         for _c in _unplaced:
-            _png = _c.get('png') or export_chart_as_png(_c['fig'])
+            _png = _c.get('png')
             if _png is not None:
                 from reportlab.platypus import Image as _RLImage
-                story.append(_RLImage(BytesIO(_png), width=avail_w, height=avail_w * 500 / 1100))
-                story.append(Paragraph(f"图: {_c['caption']}", s_date))
+                story.append(_RLImage(BytesIO(_png), width=avail_w, height=avail_w * 440 / 960))
+                story.append(Paragraph(f"图: {inline(_c['caption'])}", s_date))
                 story.append(Spacer(1, 8 * pt))
 
     doc.build(story)
