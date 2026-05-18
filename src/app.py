@@ -846,16 +846,17 @@ def _render_report_button(msg: dict, msg_idx: int) -> None:
 
             output_format = "all" if len(fmts) == 3 else "+".join(fmts)
 
-            # 从该消息之前的对话中提取用户问题作为报告标题
+            # 从该消息之前的对话中提取用户问题：完整问题传给LLM，截断版用于标题
             all_msgs = st.session_state.get("messages", [])
-            user_q = ""
+            user_q_full = ""
             for m in reversed(all_msgs[:msg_idx + 1]):
                 if m.get("role") == "user" and m.get("content"):
-                    user_q = m["content"][:50].strip().rstrip("。？?！!，,")
+                    user_q_full = m["content"].strip()
                     break
-            report_title = f"{user_q}分析报告" if user_q else "本次分析报告"
+            user_q_short = user_q_full[:50].rstrip("。？?！!，,") if user_q_full else ""
+            report_title = f"{user_q_short}分析报告" if user_q_short else "本次分析报告"
 
-            # 清空暂存区，调用 generate_report
+            # 清空暂存区，调用 generate_report（传入完整原始问题，确保报告全面覆盖）
             st.session_state["_report_output"] = []
             from tools import generate_report as _gen
             with st.spinner("正在生成报告，请稍候…"):
@@ -865,6 +866,7 @@ def _render_report_button(msg: dict, msg_idx: int) -> None:
                     audience="operation",
                     output_format=output_format,
                     embed_charts=False,
+                    user_question=user_q_full,
                 )
 
             # 把结果挂到本条消息
