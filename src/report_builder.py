@@ -1072,7 +1072,7 @@ def markdown_to_pdf(
     _SYM_FALLBACK = {   # only applied when font is NOT YaHei (SimHei fallback)
         '×':   'x',     # x (multiplication)
         '÷':   '/',     # / (division)
-        '±':   '+/-',   # +/- (plus-minus)
+        # ± (U+00B1) 是 Latin-1 标准字符，Noto CJK / WQY 均支持，无需替换
         '≥': '>=',    # >=
         '≤': '<=',    # <=
         '≠': '!=',    # !=
