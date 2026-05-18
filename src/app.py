@@ -59,9 +59,13 @@ st.markdown(
     </style>
     <script>
     (function() {
-        document.addEventListener('keydown', function(e) {
+        // Streamlit 的键盘快捷键监听在 document（capture 阶段）。
+        // window capture 先于 document capture 执行，
+        // 用 stopImmediatePropagation 阻止事件到达 document，
+        // 但不调用 preventDefault，浏览器原生复制仍正常工作。
+        window.addEventListener('keydown', function(e) {
             if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
-                e.stopPropagation();
+                e.stopImmediatePropagation();
             }
         }, true);
     })();
