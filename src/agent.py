@@ -27,7 +27,7 @@ from tools import TOOLS_SCHEMA, execute_tool
 # 词云关键词正则：中英文全覆盖
 _WORDCLOUD_RE = re.compile(r'词云|word\s*cloud|wordcloud', re.IGNORECASE)
 
-MAX_ITERATIONS = 12
+MAX_ITERATIONS = 25
 MAX_CONTEXT_CHARS = 50_000  # 超过此字符数时触发历史截断
 KEEP_ROUNDS = 6             # 始终保留最近 N 轮完整对话
 
@@ -486,7 +486,7 @@ def run_agent(
         # DeepSeek 偶发假 tool_calls（字段存在但内容为 None 或空列表）
         has_tool_calls = bool(llm_message.tool_calls)
 
-        if not has_tool_calls or finish_reason == "stop":
+        if not has_tool_calls:
             return {
                 "final_answer":   llm_message.content or "",
                 "tool_calls_log": tool_calls_log,
@@ -567,7 +567,7 @@ def run_agent(
 
     # 超出最大迭代次数（防无限循环）
     return {
-        "final_answer":   "⚠️ Agent 超出最大工具调用次数（12次），请换一个更具体的问题重试。",
+        "final_answer":   f"⚠️ Agent 超出最大工具调用次数（{MAX_ITERATIONS}次），已完成部分分析。如需继续，请追问更具体的子问题。",
         "tool_calls_log": tool_calls_log,
         "needs_confirm":  None,
     }
