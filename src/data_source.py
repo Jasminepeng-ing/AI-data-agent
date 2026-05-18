@@ -329,9 +329,12 @@ class DataSource:
             # 先清理同名旧条目，防止重复
             self._unregister_view(view_name)
 
-            # 纯内存注册：DataFrame 直接挂载为可查询的虚拟表
-            # 不写入 olist.db，速度快（无磁盘 IO），重启后自动消失
-            self.conn.register(view_name, df)
+            # 创建真实 DuckDB 内存表（兼容新版 DuckDB 1.x）
+            # conn.register() 在新版 DuckDB 中不写入 information_schema.tables，
+            # 导致 list_tables() 无法发现已上传的表；改用 CREATE TABLE 确保可见。
+            self.conn.register("_tmp_upload", df)
+            self.conn.execute(f'CREATE OR REPLACE TABLE "{view_name}" AS SELECT * FROM _tmp_upload')
+            self.conn.unregister("_tmp_upload")
 
             return view_name
 
@@ -387,6 +390,10 @@ class DataSource:
             pass
         try:
             self.conn.execute(f'DROP VIEW IF EXISTS "{view_name}"')
+        except Exception:
+            pass
+        try:
+            self.conn.execute(f'DROP TABLE IF EXISTS "{view_name}"')
         except Exception:
             pass
 
