@@ -935,10 +935,17 @@ hr     {{ border: none; border-top: 1px solid #CCC; margin: 12pt 0; }}
 
 # 候选中文字体路径（按优先级）；.ttc 用 subfontIndex=0 加载
 _CJK_FONT_PATHS = [
-    r"C:\Windows\Fonts\msyh.ttc",       # 微软雅黑 Regular（Win10/11，字形最全）
-    r"C:\Windows\Fonts\msyh.ttf",       # 部分系统为 TTF 格式
-    r"C:\Windows\Fonts\msyhbd.ttc",     # 微软雅黑 Bold（备用）
-    r"C:\Windows\Fonts\simhei.ttf",     # 黑体（旧系统备选）
+    # Linux / Streamlit Cloud（packages.txt 安装 fonts-noto-cjk / fonts-wqy-microhei）
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    # Windows（本地开发）
+    r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\msyh.ttf",
+    r"C:\Windows\Fonts\msyhbd.ttc",
+    r"C:\Windows\Fonts\simhei.ttf",
     r"C:\Windows\Fonts\simkai.ttf",
     r"C:\Windows\Fonts\simfang.ttf",
     r"C:\Windows\Fonts\STZHONGS.TTF",
