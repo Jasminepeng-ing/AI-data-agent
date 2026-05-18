@@ -47,6 +47,7 @@ st.set_page_config(
 )
 
 # 隐藏 file_uploader 内置的文件列表（含 × 按钮），只保留拖拽/选择区域
+# 同时阻止 Streamlit 的全局 C 键快捷键在 Ctrl+C 时触发 Clear caches 弹窗
 st.markdown(
     """
     <style>
@@ -56,6 +57,15 @@ st.markdown(
         display: none !important;
     }
     </style>
+    <script>
+    (function() {
+        document.addEventListener('keydown', function(e) {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
+                e.stopPropagation();
+            }
+        }, true);
+    })();
+    </script>
     """,
     unsafe_allow_html=True,
 )
