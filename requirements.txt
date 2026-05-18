@@ -7,3 +7,4 @@ weasyprint
 reportlab
 python-dotenv
 openai
+openpyxl
