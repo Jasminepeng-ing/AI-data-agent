@@ -47,7 +47,6 @@ st.set_page_config(
 )
 
 # 隐藏 file_uploader 内置的文件列表（含 × 按钮），只保留拖拽/选择区域
-# 同时阻止 Streamlit 的全局 C 键快捷键在 Ctrl+C 时触发 Clear caches 弹窗
 st.markdown(
     """
     <style>
@@ -57,22 +56,31 @@ st.markdown(
         display: none !important;
     }
     </style>
-    <script>
-    (function() {
-        // Streamlit 的键盘快捷键监听在 document（capture 阶段）。
-        // window capture 先于 document capture 执行，
-        // 用 stopImmediatePropagation 阻止事件到达 document，
-        // 但不调用 preventDefault，浏览器原生复制仍正常工作。
-        window.addEventListener('keydown', function(e) {
-            if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
-                e.stopImmediatePropagation();
-            }
-        }, true);
-    })();
-    </script>
     """,
     unsafe_allow_html=True,
 )
+
+# 阻止 Ctrl+C 触发 Streamlit 的 Clear caches 弹窗。
+# st.markdown 中的 <script> 不执行（React dangerouslySetInnerHTML 安全限制），
+# 必须用 components.html 创建真实 iframe，才能可靠执行 JavaScript。
+import streamlit.components.v1 as components
+components.html("""
+<script>
+(function() {
+    try {
+        // 从 iframe 访问父页面 window（同源，无跨域问题）
+        // window.parent capture 阶段先于 Streamlit 的 document 监听器执行
+        // stopImmediatePropagation 阻断 Streamlit 的 C 键快捷键
+        // 不调用 preventDefault，浏览器原生 Ctrl+C 复制正常工作
+        window.parent.addEventListener('keydown', function(e) {
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+                e.stopImmediatePropagation();
+            }
+        }, true);
+    } catch(err) {}
+})();
+</script>
+""", height=0)
 
 
 # ── 缓存数据库连接 ────────────────────────────────────────────────────────────
