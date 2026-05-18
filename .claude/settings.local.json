@@ -63,7 +63,9 @@
       "PowerShell(Get-Process python -ErrorAction SilentlyContinue)",
       "Bash(D:/Anaconda3/python.exe -m pip install \"kaleido>=1.0.0\" --user)",
       "Bash(start test_inline.pdf)",
-      "Bash(start test_inline.docx)"
+      "Bash(start test_inline.docx)",
+      "Bash(python \"D:/AI/Claude/AI-data-agent/tests/test_report_smoke.py\")",
+      "Bash(python -c \"import sys; data=sys.stdin.read\\(\\); print\\('\\\\n'.join\\(l for l in data.splitlines\\(\\) if 'PASS' in l or '===' in l\\)\\)\")"
     ]
   }
 }

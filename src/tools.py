@@ -551,7 +551,8 @@ def query_database(sql: str, intent: str, ds) -> str:
         return "错误: SQL 不能为空"
 
     try:
-        df = ds.query(sql)
+        _hidden = set(st.session_state.get("hidden_tables", set()))
+        df = ds.query(sql, hidden_tables=_hidden)
 
         if "query_results" not in st.session_state:
             st.session_state.query_results = {}
@@ -1545,7 +1546,8 @@ def _split_base_sql(base_sql: str) -> tuple[str, str]:
 
 def _run_sql(sql: str, ds) -> tuple[float | None, pd.DataFrame]:
     """执行 SQL，返回 (首行首数值列的值, 完整 DataFrame)。"""
-    df = ds.query(sql)
+    _hidden = set(st.session_state.get("hidden_tables", set()))
+    df = ds.query(sql, hidden_tables=_hidden)
     if df.empty:
         return None, df
     # 取第一个数值列作为指标值
@@ -1559,7 +1561,8 @@ def _run_sql(sql: str, ds) -> tuple[float | None, pd.DataFrame]:
 def _run_dim_sql(sql: str, ds) -> pd.DataFrame:
     """执行维度 SQL，容错：执行失败返回空 DataFrame。"""
     try:
-        return ds.query(sql)
+        _hidden = set(st.session_state.get("hidden_tables", set()))
+        return ds.query(sql, hidden_tables=_hidden)
     except Exception:
         return pd.DataFrame()
 

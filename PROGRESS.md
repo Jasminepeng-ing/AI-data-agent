@@ -2,17 +2,42 @@
 
 ---
 
-## ⏳ 待处理 Bug（2026-05-09 记录）
+## ✅ 已修复 Bug（2026-05-09）
+
+### Bug-3：PDF/Word 报告 `####` 标题显示为字面文字 + emoji 渲染为方框
+
+**现象**：PDF 报告中 `#### 🏆 重要价值客户` 一行直接显示 `#### 🏆`，emoji 显示为方框。
+
+**根因**：
+- `markdown_to_pdf`（ReportLab 直接渲染）**没有** h4（`####`）处理分支，`#### xxx` 行落入 `else` 段落，`####` 被当正文原样输出。
+- Microsoft YaHei / SimHei 等 CJK 字体不含 emoji 字形，emoji 输出为空白方框。
+
+**修复**：
+- `src/report_builder.py` 新增 `_EMOJI_STRIP_RE`（模块级常量），覆盖 U+1F000–U+1FFFF、U+2600–U+27BF、FE0F/200D 范围。
+- PDF `inline()` 函数开头调用 `_EMOJI_STRIP_RE.sub('', text)`，去除所有不可渲染 emoji。
+- PDF 和 Word 均新增 `elif re.match(r'^#{4,}', ...)` 分支，h4/h5/h6 降级为 h3 样式渲染。
+
+---
+
+### Bug-4：PDF/Word 图表与解读文字顺序错误（三段解读后三图堆叠）
+
+**现象**：`## 图表解读` 章节内三段解读文字连续输出，三张图表最后集中堆叠，而非"解读1→图1→解读2→图2→..."。
+
+**根因**：LLM 生成的图表解读使用 `### 图表 1：xxx` 格式，被 h3 分支处理后直接跳出，图表注入逻辑（仅匹配裸写 `图表1：xxx`）从未触发。
+
+**修复**：
+- PDF 和 Word 的 `###` 分支均新增判断：若 h3 内容匹配 `_CHART_LABEL_RE` / `_WORD_CHART_RE`，则在渲染 h3 标题后，原地消费后续 bullet 列表（解读内容），再立即调用 `_inject_chart_inline` / `_word_inject_chart`。
+- 实现"解读文字 → 图表"严格交替排列。
+
+---
 
 ### Bug-1：Word 生成失败（`name 'note_run' is not defined`）
 
 **现象**：点击下载 Word 报告时控制台报 `NameError: name 'note_run' is not defined`，Word 文件无法生成。
 
-**推测根因**：`markdown_to_word` 重构"末尾图表追加"逻辑时，原 `else` 分支（无图表时显示提示语）中的 `note_run` 变量被删除但引用保留，或变量作用域被破坏。
+**根因（确认）**：`markdown_to_word` 重构"末尾图表追加"兜底块时，原"提示段落"创建代码被删除，但第 324–325 行的 `note_run.font.*` 样式引用被遗留，导致每次执行兜底逻辑时抛出 `NameError`。
 
-**定位位置**：`src/report_builder.py` → `markdown_to_word()` 末尾 `_word_unplaced` 兜底块。
-
-**优先级**：高（Word 完全不可用）。
+**修复**：删除 `src/report_builder.py` 第 324–325 行（孤立的 `note_run.font.italic` 和 `note_run.font.color.rgb` 调用），兜底块仅保留图表插入与图注样式，功能完整。
 
 ---
 
@@ -89,6 +114,57 @@
 |---|---|
 | `reportlab` | 新增到 `requirements.txt`（PDF 生成必需，之前漏写）|
 | `kaleido` | Anaconda 环境 `pip install "kaleido>=1.0.0" --user` 升级至 v1.3.0 |
+
+---
+
+### Fix：PDF 不合理换行（CJK 断行规则 + 数字量词 `&nbsp;`）
+
+**现象**：PDF 报告中出现 `"占比接近\n40%"` 、`"3.2\n倍"` 等不合理换行，Word / HTML 无此问题。
+
+**根因**：ReportLab 默认断行算法不理解 CJK 排版规则，遇到中文段落内的数字+量词组合时，直接在数字与量词之间断行；段落样式未设置 `wordWrap='CJK'`，导致中英文混排时按英文空格规则断行。
+
+**修复（`src/report_builder.py` `markdown_to_pdf`）**：
+
+| 改动 | 内容 |
+|---|---|
+| 所有段落样式加 `wordWrap='CJK'` | `s_date`、`s_h1`、`s_h2_text`、`s_h3`、`s_body`、`s_bullet`、`s_num` 均设置 `wordWrap='CJK'`，启用 CJK 排版断行规则 |
+| `inline()` 加数字量词防断行 | XML 转义之后追加一行正则：`re.sub(r'(\d+(?:\.\d+)?)\s*([倍个万亿千百元笔次年月日%])', r'\1&nbsp;\2', text)`，将数字与常用中文量词之间替换为 ReportLab 不断行的 `&nbsp;` |
+
+---
+
+### Fix：PDF 图表解读文字后直接紧跟图片（`_handle_chart_label_block` + `KeepTogether`）
+
+**现象**：PDF 报告中图表解读文字（`图表1: xxx` 及后续 `>` blockquote）与对应图片不在同一块——解读在第 3 页，图片跑到第 4 页甚至附录。
+
+**根因**：原逻辑遇到 `图表1:` 标签行时只渲染文字，图片注入依赖 `_add_sec_chart()` 在下一个 `##` 章节标题处批量插入，二者之间隔了整个章节的内容。
+
+**修复（`src/report_builder.py` `markdown_to_pdf`）**：
+
+| 改动 | 内容 |
+|---|---|
+| 新增 `_handle_chart_label_block(label_text, label_style, start_i)` | 从标签行起，逐行消费跟随的 `>` blockquote（含跨空行探测），匹配并立即注入对应图表 PNG；整个块用 `KeepTogether` 包裹，确保文字与图片不跨页分离 |
+| `###` h4 检测扩展 | `#{4,}` 分支新增：若标题匹配 `_CHART_LABEL_RE`，走 `_handle_chart_label_block` 而非普通 h4 渲染 |
+| 裸文图表标签简化 | 主循环中 `_CHART_LABEL_RE` 分支简化为一行，委托给 `_handle_chart_label_block` |
+
+---
+
+### Fix：PDF 图表改为在 `###` 子节内容末尾注入（`_h3_chart_map` + `_add_h3_chart()`）
+
+**现象**：PDF 报告"三、详细分析"章节内各图表全部堆积在章节末尾，而非出现在各自对应的 `###` 子节（如 3.1、3.2）末尾。
+
+**根因**：`_add_sec_chart()` 以 `##` 章节为边界批量注入，没有 `###` 子节级别的匹配与注入机制。
+
+**修复（`src/report_builder.py` `markdown_to_pdf`）**：
+
+| 改动 | 内容 |
+|---|---|
+| `_h3_chart_map` 预计算 | 在 `_sec_chart_map` 之后，提取所有 `###` 子节标题，用 `_match_chart_for_section()` 逐一预匹配图表，结果存入 `dict[子节序号 → 图表列表]`；预计算结束后重置所有 `placed` 标志 |
+| `_add_h3_chart()` 内层函数 | 读取 `_cur_h3[0]` 当前子节索引，将该子节已匹配但未注入的图表追加到 `story`（PNG + 图注 + Spacer）|
+| `###` 处理器 | 遇到新 `###` 时先调 `_add_h3_chart()`（注入上一子节图表），再将 `_cur_h3[0] += 1` 推进计数器 |
+| `##` 处理器 | 遇到新 `##` 时先调 `_add_h3_chart()`（注入当前子节图表），再调 `_add_sec_chart()`（章节级兜底），并将 `_cur_h3[0] = -1` 重置 |
+| 主循环结束后 | 依次调用 `_add_h3_chart()` + `_add_sec_chart()`，处理文档最后一个子节和章节的未注入图表 |
+
+**注入优先级（三级）**：inline `图表N:` 标签 > `###` 子节边界 > `##` 章节边界（兜底）。
 
 ---
 

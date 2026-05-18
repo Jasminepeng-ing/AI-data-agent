@@ -17,6 +17,34 @@ import base64
 from io import BytesIO
 from datetime import datetime
 
+# Emoji Unicode 区间：Microsoft YaHei / SimHei 等 CJK 字体无法渲染，会显示为方框
+# Markdown 图片占位符：LLM 有时输出 ![图表N:caption]()，需识别并注入真实图表
+_MD_IMG_RE = re.compile(r'^!\[([^\]]*)\]\([^)]*\)')
+
+# 图表标签行（与函数内局部变量同模式，用于 _is_block_start）
+_BLOCK_CHART_RE = re.compile(r'^图表?\s*\d+\s*[：:]')
+
+
+def _is_block_start(line: str) -> bool:
+    """判断一行是否为新块的起始（应中止软换行续行的累积）。"""
+    s = line.strip()
+    return (not s
+            or bool(re.match(r'^#{1,6}[\s#]', s))
+            or bool(re.match(r'^[-*] ', s))
+            or bool(re.match(r'^\d+\. ', s))
+            or s.startswith('|')
+            or bool(re.match(r'^-{3,}\s*$', s))
+            or s.startswith('>')
+            or bool(_BLOCK_CHART_RE.match(s))
+            or bool(_MD_IMG_RE.match(s)))
+
+_EMOJI_STRIP_RE = re.compile(
+    '[' + '\U0001F000-\U0001FFFF\U00002600-\U000027BF'
+    + chr(0xFE0F)   # Variation Selector-16
+    + chr(0x200D)   # Zero-Width Joiner
+    + ']+'
+)
+
 
 # ── 函数 1: markdown_to_word ─────────────────────────────────────────────────
 
@@ -179,7 +207,44 @@ def markdown_to_word(
 
         # 三级标题
         if re.match(r'^###\s+', line):
-            _para(line[4:].strip(), bold=True, size=12, space_before=6)
+            h3_text = _EMOJI_STRIP_RE.sub('', line[4:].strip()).strip()
+            # 若 h3 本身就是"图表N：xxx"标题，消费后续 bullet 并注入图表
+            if _WORD_CHART_RE.match(h3_text):
+                _para(h3_text, bold=True, size=12, space_before=6, space_after=2)
+                i += 1
+                while i < len(lines):
+                    bl = lines[i].strip()
+                    if re.match(r'^[-*]\s+', bl):
+                        content = re.sub(r'^[-*]\s+', '', bl)
+                        p = doc.add_paragraph(style="List Bullet")
+                        p.paragraph_format.left_indent = Cm(0.5)
+                        p.paragraph_format.space_after = Pt(2)
+                        bparts = re.split(r'(\*\*[^*]+\*\*)', content)
+                        for bp in bparts:
+                            bm = re.match(r'\*\*([^*]+)\*\*', bp)
+                            run = p.add_run(bm.group(1) if bm else bp)
+                            run.bold = bool(bm)
+                            run.font.size = Pt(10)
+                        i += 1
+                    elif bl == '':
+                        j = i + 1
+                        while j < len(lines) and not lines[j].strip():
+                            j += 1
+                        if j < len(lines) and re.match(r'^[-*]\s+', lines[j].strip()):
+                            i += 1
+                        else:
+                            break
+                    else:
+                        break
+                _word_inject_chart(_WORD_CHART_RE.sub('', h3_text).strip())
+                continue
+            _para(h3_text, bold=True, size=12, space_before=6)
+            i += 1; continue
+
+        # 四级及以下标题 (####) → 去除 emoji，渲染为加粗正文（同 h3 风格）
+        if re.match(r'^#{4,}\s+', line):
+            h4_text = _EMOJI_STRIP_RE.sub('', re.sub(r'^#{4,}\s+', '', line).strip()).strip()
+            _para(h4_text, bold=True, size=11, space_before=4, space_after=2)
             i += 1; continue
 
         # 水平线
@@ -233,24 +298,33 @@ def markdown_to_word(
             doc.add_paragraph()  # 表后空行
             i = j; continue
 
-        # 项目符号（- 或 * 开头）
+        # 项目符号（- 或 * 开头）；合并软换行续行为单一 bullet 段落
         if re.match(r'^[-*]\s+', line):
-            content = re.sub(r'^[-*]\s+', '', line)
+            content_parts = [re.sub(r'^[-*]\s+', '', line.strip())]
+            i += 1
+            while i < len(lines) and not _is_block_start(lines[i]):
+                content_parts.append(lines[i].strip())
+                i += 1
+            content = ''.join(content_parts)
             p = doc.add_paragraph(style="List Bullet")
             p.paragraph_format.left_indent = Cm(0.5)
             p.paragraph_format.space_after = Pt(2)
-            # 内联加粗
             parts = re.split(r'(\*\*[^*]+\*\*)', content)
             for part in parts:
                 m = re.match(r'\*\*([^*]+)\*\*', part)
                 run = p.add_run(m.group(1) if m else part)
                 run.bold = bool(m)
                 run.font.size = Pt(11)
-            i += 1; continue
+            continue
 
-        # 数字编号列表（1. 2. 等）
+        # 数字编号列表（1. 2. 等）；合并软换行续行
         if re.match(r'^\d+\.\s+', line):
-            content = re.sub(r'^\d+\.\s+', '', line)
+            content_parts = [re.sub(r'^\d+\.\s+', '', line.strip())]
+            i += 1
+            while i < len(lines) and not _is_block_start(lines[i]):
+                content_parts.append(lines[i].strip())
+                i += 1
+            content = ''.join(content_parts)
             p = doc.add_paragraph(style="List Number")
             p.paragraph_format.left_indent = Cm(0.5)
             p.paragraph_format.space_after = Pt(2)
@@ -260,7 +334,7 @@ def markdown_to_word(
                 run = p.add_run(m.group(1) if m else part)
                 run.bold = bool(m)
                 run.font.size = Pt(11)
-            i += 1; continue
+            continue
 
         # 图表标签行（如 "图表1:xxx"）—— 先输出标签文字，再消费 > 解读块，最后内联插图
         if _WORD_CHART_RE.match(line.strip()):
@@ -287,6 +361,13 @@ def markdown_to_word(
             _word_inject_chart(caption_hint)
             continue
 
+        # Markdown 图片占位符 ![图表N:caption]() → 注入匹配图表（不输出文字）
+        if _MD_IMG_RE.match(line.strip()):
+            raw_cap = _MD_IMG_RE.match(line.strip()).group(1)
+            caption_hint = re.sub(r'^图表?\s*\d+\s*[：:]', '', raw_cap).strip()
+            _word_inject_chart(caption_hint)
+            i += 1; continue
+
         # blockquote（> 行，非图表标签后的独立解读）
         if line.strip().startswith('>'):
             _para(line.strip().lstrip('>').strip(), size=10, space_before=0,
@@ -297,9 +378,13 @@ def markdown_to_word(
         if not line.strip():
             i += 1; continue
 
-        # 普通正文（支持内联加粗）
-        _para(line, size=11, space_before=0, space_after=4)
+        # 普通正文（支持内联加粗）；合并连续软换行行为单一段落
+        para_parts = [line.strip()]
         i += 1
+        while i < len(lines) and not _is_block_start(lines[i]):
+            para_parts.append(lines[i].strip())
+            i += 1
+        _para(''.join(para_parts), size=11, space_before=0, space_after=4)
 
     # ── 未匹配图表兜底：追加到末尾 ───────────────────────────────────────────
     if _word_unplaced and any(png for _, png in _word_unplaced):
@@ -321,8 +406,6 @@ def markdown_to_word(
             cap_run.font.size = Pt(9)
             cap_run.font.italic = True
             cap_run.font.color.rgb = RGBColor(0x6B, 0x72, 0x80)
-        note_run.font.italic = True
-        note_run.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
 
     buf = BytesIO()
     doc.save(buf)
@@ -937,19 +1020,19 @@ def markdown_to_pdf(
                    leading=13,  spaceAfter=0)
     # 正文
     s_date     = S("D",   fontSize=9,  textColor=C_GRAY,  alignment=1,
-                   leading=13,  spaceAfter=6*pt)
+                   leading=13,  spaceAfter=6*pt, wordWrap='CJK')
     s_h1       = S("H1",  fontSize=16, textColor=C_NAVY,
-                   spaceBefore=22*pt, spaceAfter=6*pt, leading=22)
+                   spaceBefore=22*pt, spaceAfter=6*pt, leading=22, wordWrap='CJK')
     s_h2_text  = S("H2T", fontSize=13, textColor=C_NAVY,
-                   spaceBefore=0, spaceAfter=0, leading=20)
+                   spaceBefore=0, spaceAfter=0, leading=20, wordWrap='CJK')
     s_h3       = S("H3",  fontSize=11, textColor=HexColor("#374151"),
-                   spaceBefore=9*pt, spaceAfter=3*pt, leading=16)
+                   spaceBefore=9*pt, spaceAfter=3*pt, leading=16, wordWrap='CJK')
     s_body     = S("B",   fontSize=10, textColor=C_DARK,
-                   spaceAfter=6*pt, leading=17)
+                   spaceAfter=6*pt, leading=17, wordWrap='CJK')
     s_bullet   = S("BL",  fontSize=10, textColor=C_DARK,
-                   spaceAfter=3*pt, leading=16, leftIndent=14*pt)
+                   spaceAfter=3*pt, leading=16, leftIndent=14*pt, wordWrap='CJK')
     s_num      = S("NL",  fontSize=10, textColor=C_DARK,
-                   spaceAfter=3*pt, leading=16, leftIndent=18*pt, firstLineIndent=-18*pt)
+                   spaceAfter=3*pt, leading=16, leftIndent=18*pt, firstLineIndent=-18*pt, wordWrap='CJK')
     s_cell     = S("C",   fontSize=9,  textColor=HexColor("#374151"), leading=14)
     s_hcell    = S("HC",  fontSize=9,  textColor=white,  leading=14)
 
@@ -1053,10 +1136,13 @@ def markdown_to_pdf(
 
     def inline(text: str) -> str:
         """千位符 + XML 转义 + 符号规范化 + **bold** → <b>。"""
+        text = _EMOJI_STRIP_RE.sub('', text).strip()   # CJK 字体无法渲染的 emoji 直接去除
         text = _add_thousands(text)
         for src, dst in _SYM_MAP.items():
             text = text.replace(src, dst)
         text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        # 数字与中文量词/单位之间插入不换行空格，防止"3.2\n倍"等不合理断行
+        text = re.sub(r'(\d+(?:\.\d+)?)\s*([倍个万亿千百元笔次年月日%])', r'\1&nbsp;\2', text)
         text = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', text)
         return text
 
@@ -1139,6 +1225,26 @@ def markdown_to_pdf(
         _c['placed'] = False
     _cur_sec = [-1]
 
+    # ── ### 子节级图表预匹配 ─────────────────────────────────────────────────
+    _h3_titles = re.findall(r'^###\s+(.+)$', markdown_content, re.MULTILINE)
+    print(f"[markdown_to_pdf] 报告子节(###): {_h3_titles}")
+    _h3_chart_map: dict = {}
+    for _hi, _ht in enumerate(_h3_titles):
+        _candidates = [c for c in _pdf_charts if not c['placed']]
+        if not _candidates:
+            continue
+        _mc = _match_chart_for_section(_ht, _candidates)
+        if _mc:
+            _mc['placed'] = True
+            _h3_chart_map[_hi] = [_mc]
+    for _hi, _ht in enumerate(_h3_titles):
+        _matched = [c['caption'] for c in _h3_chart_map.get(_hi, [])]
+        print(f"[markdown_to_pdf] 子节[{_hi}]'{_ht}' → 匹配图表: {_matched or '无'}")
+    print(f"[markdown_to_pdf] h3未匹配图表: {[c['caption'] for c in _pdf_charts if not c['placed']] or '无'}")
+    for _c in _pdf_charts:
+        _c['placed'] = False    # 重置，供正式排版使用
+    _cur_h3 = [-1]
+
     # 图表解读行正则：匹配 "图表1:" / "图1：" / "图表 2:" 等写法
     _CHART_LABEL_RE = re.compile(r'^图表?\s*\d+\s*[：:]')
 
@@ -1180,6 +1286,75 @@ def markdown_to_pdf(
             story.append(Paragraph(f"图: {inline(c['caption'])}", s_date))
             story.append(Spacer(1, 8 * pt))
 
+    def _add_h3_chart():
+        """把当前 ### 子节匹配的图表插入 story（子节末尾注入）。"""
+        from reportlab.platypus import Image as _RLImage
+        idx = _cur_h3[0]
+        if idx < 0:
+            return
+        for c in _h3_chart_map.get(idx, []):
+            if c.get('placed'):
+                continue
+            png = c.get('png')
+            if png is None:
+                continue
+            c['placed'] = True
+            story.append(Spacer(1, 6 * pt))
+            story.append(_RLImage(BytesIO(png), width=avail_w,
+                                  height=avail_w * 440 / 960))
+            story.append(Paragraph(f"图: {inline(c['caption'])}", s_date))
+            story.append(Spacer(1, 8 * pt))
+
+    def _handle_chart_label_block(label_text: str, label_style, start_i: int) -> int:
+        """
+        把图表标签行 + 后续解读文字 + 图表图片打包为 KeepTogether 块。
+        消费顺序：> blockquote 或普通段落（直到遇到新块为止），然后紧跟图表图片。
+        返回处理后的新行下标。
+        """
+        from reportlab.platypus import Image as _RLImage
+        s_bq = S("BQ", fontSize=10, textColor=HexColor("#4B5563"),
+                 leftIndent=14*pt, spaceAfter=4*pt, leading=17, wordWrap='CJK')
+        block = [Paragraph(inline(label_text), label_style)]
+        ci = start_i
+
+        while ci < len(lines):
+            bq = lines[ci].strip()
+            if bq.startswith('>'):
+                block.append(Paragraph(inline(bq.lstrip('>').strip()), s_bq))
+                ci += 1
+            elif bq == '':
+                j = ci + 1
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j < len(lines) and not _is_block_start(lines[j]):
+                    ci += 1   # 跳过空行，继续消费解读文字
+                else:
+                    break
+            elif not _is_block_start(bq):   # 普通解读段落
+                block.append(Paragraph(inline(bq), s_bq))
+                ci += 1
+            else:
+                break
+
+        # 图表在解读文字之后注入
+        caption_hint = _CHART_LABEL_RE.sub('', label_text).strip()
+        candidates = [c for c in _pdf_charts if not c.get('placed')]
+        if candidates:
+            matched = _match_chart_for_section(caption_hint, candidates)
+            if matched is None:
+                matched = candidates[0]
+            matched['placed'] = True
+            png = matched.get('png')
+            if png:
+                block.append(Spacer(1, 6 * pt))
+                block.append(_RLImage(BytesIO(png), width=avail_w,
+                                      height=avail_w * 440 / 960))
+                block.append(Paragraph(f"图: {inline(matched['caption'])}", s_date))
+                block.append(Spacer(1, 8 * pt))
+
+        story.append(KeepTogether(block))
+        return ci
+
     while i < len(lines):
         line     = lines[i]
         stripped = line.strip()
@@ -1190,16 +1365,54 @@ def markdown_to_pdf(
             i += 1
 
         elif re.match(r'^## [^#]', stripped):
-            _add_sec_chart()           # 把上一章节匹配的图表插在章节末尾
+            _add_h3_chart()            # 注入当前 h3 子节末尾图表
+            _add_sec_chart()           # 把上一章节匹配的图表插在章节末尾（兜底）
             _cur_sec[0] += 1
+            _cur_h3[0] = -1            # 新章节时重置 h3 计数器
             story.append(Spacer(1, 14*pt))
             story.append(_h2_flowable(inline(stripped[3:])))
             story.append(Spacer(1, 5*pt))
             i += 1
 
         elif re.match(r'^### ', stripped):
-            story.append(Paragraph(inline(stripped[4:]), s_h3))
-            i += 1
+            _add_h3_chart()            # 注入上一 h3 子节末尾图表
+            _cur_h3[0] += 1            # 推进子节计数器
+            h3_text = stripped[4:]
+            # 若 h3 标题本身是"图表N：xxx"，消费后续 bullet 并立即注入图表
+            if _CHART_LABEL_RE.match(h3_text):
+                story.append(Paragraph(inline(h3_text), s_h3))
+                i += 1
+                s_bq2 = S("BQ2", fontSize=10, textColor=HexColor("#4B5563"),
+                          leftIndent=14*pt, spaceAfter=4*pt, leading=17)
+                while i < len(lines):
+                    bl = lines[i].strip()
+                    if re.match(r'^[-*] ', bl):
+                        story.append(Paragraph(f"• {inline(bl[2:])}", s_bullet))
+                        i += 1
+                    elif bl == '':
+                        j = i + 1
+                        while j < len(lines) and not lines[j].strip():
+                            j += 1
+                        if j < len(lines) and re.match(r'^[-*] ', lines[j].strip()):
+                            i += 1
+                        else:
+                            break
+                    else:
+                        break
+                _inject_chart_inline(_CHART_LABEL_RE.sub('', h3_text).strip())
+            else:
+                story.append(Paragraph(inline(h3_text), s_h3))
+                i += 1
+
+        elif re.match(r'^#{4,} ', stripped):
+            h4_text = re.sub(r'^#{4,} ', '', stripped)
+            if _CHART_LABEL_RE.match(h4_text):
+                # 四级及以下的图表标签标题：解读+图表同块
+                i = _handle_chart_label_block(h4_text, s_h3, i + 1)
+            else:
+                # 普通四级标题：渲染为 h3 样式
+                story.append(Paragraph(inline(h4_text), s_h3))
+                i += 1
 
         elif re.match(r'^-{3,}$', stripped):
             story.append(HRFlowable(width="100%", thickness=0.5, color=C_BDR))
@@ -1207,19 +1420,25 @@ def markdown_to_pdf(
             i += 1
 
         elif re.match(r'^[-*] ', stripped):
-            # ── 无序列表：用 Paragraph 直接加 • 前缀，避免 ListFlowable 字形问题
+            # ── 无序列表：合并软换行续行，再创建 bullet 段落
             while i < len(lines) and re.match(r'^[-*] ', lines[i].strip()):
-                txt = inline(lines[i].strip()[2:])
-                story.append(Paragraph(f"• {txt}", s_bullet))
+                bullet_parts = [lines[i].strip()[2:]]
                 i += 1
+                while i < len(lines) and not _is_block_start(lines[i]):
+                    bullet_parts.append(lines[i].strip())
+                    i += 1
+                story.append(Paragraph(f"• {inline(''.join(bullet_parts))}", s_bullet))
 
         elif re.match(r'^\d+\. ', stripped):
-            # ── 有序列表：编号写入段落文字，保持对齐
+            # ── 有序列表：合并软换行续行
             num = 1
             while i < len(lines) and re.match(r'^\d+\. ', lines[i].strip()):
-                txt = inline(re.sub(r'^\d+\. ', '', lines[i].strip()))
-                story.append(Paragraph(f"{num}. {txt}", s_num))
+                num_parts = [re.sub(r'^\d+\. ', '', lines[i].strip())]
                 i += 1
+                while i < len(lines) and not _is_block_start(lines[i]):
+                    num_parts.append(lines[i].strip())
+                    i += 1
+                story.append(Paragraph(f"{num}. {inline(''.join(num_parts))}", s_num))
                 num += 1
 
         elif stripped.startswith("|"):
@@ -1289,42 +1508,32 @@ def markdown_to_pdf(
                 story.append(Spacer(1, 8*pt))
 
         elif _CHART_LABEL_RE.match(stripped):
-            # ── 图表标签行（如 "图表1:xxx"）: 先输出标签，再消费 > 解读块，最后注入图表
-            story.append(Paragraph(inline(stripped), s_body))
-            i += 1
-            s_bq = S("BQ", fontSize=10, textColor=HexColor("#4B5563"),
-                     leftIndent=14*pt, spaceAfter=4*pt, leading=17)
-            # 消费 blockquote：遇到空行时向前探测，若下一非空行仍是 > 则继续
-            while i < len(lines):
-                bq = lines[i].strip()
-                if bq.startswith('>'):
-                    story.append(Paragraph(inline(bq.lstrip('>').strip()), s_bq))
-                    i += 1
-                elif bq == "":
-                    # 向前探测：下一个非空行是否还是 > ?
-                    j = i + 1
-                    while j < len(lines) and lines[j].strip() == "":
-                        j += 1
-                    if j < len(lines) and lines[j].strip().startswith('>'):
-                        i += 1   # 跳过中间空行，继续消费 blockquote
-                    else:
-                        break    # 后面没有 blockquote 了，退出
-                else:
-                    break
-            # 解读文字输出完毕，紧跟注入图表
-            caption_hint = _CHART_LABEL_RE.sub('', stripped).strip()
+            # ── 图表标签行（如 "图表1:xxx"）: 解读文字 + 图表打包为 KeepTogether 块
+            i = _handle_chart_label_block(stripped, s_body, i + 1)
+
+        elif _MD_IMG_RE.match(stripped):
+            # Markdown 图片占位符 ![图表N:caption]() → 注入匹配图表（不输出文字）
+            raw_cap = _MD_IMG_RE.match(stripped).group(1)
+            caption_hint = re.sub(r'^图表?\s*\d+\s*[：:]', '', raw_cap).strip()
             _inject_chart_inline(caption_hint)
+            i += 1
 
         elif stripped == "":
             story.append(Spacer(1, 3*pt))
             i += 1
 
         else:
-            story.append(Paragraph(inline(stripped), s_body))
+            # 合并连续正文行：Markdown 软换行（单 \n）在段落内不产生段落分隔
+            para_parts = [stripped]
             i += 1
+            while i < len(lines) and not _is_block_start(lines[i]):
+                para_parts.append(lines[i].strip())
+                i += 1
+            story.append(Paragraph(inline(''.join(para_parts)), s_body))
 
     # 最后一个章节的图表
-    _add_sec_chart()
+    _add_h3_chart()      # 处理最后一个 h3 子节的图表
+    _add_sec_chart()     # 处理最后一个 ## 章节的图表（兜底）
 
     # 未匹配的图表统一追加到附录
     _unplaced = [c for c in _pdf_charts if not c['placed']]

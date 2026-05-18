@@ -16,6 +16,7 @@ DataSource 类是整个项目的"数据门卫"：
 
 import io
 import os
+import re
 import duckdb
 import pandas as pd
 
@@ -25,6 +26,9 @@ OLIST_TABLES = {
     "order_reviews", "orders", "product_category_name_translation",
     "products", "sellers",
 }
+
+# 会话级隐藏机制使用的常量（与 OLIST_TABLES 内容相同，供 app.py 导入）
+OLIST_BUILTIN_TABLES: set = set(OLIST_TABLES)
 
 # Olist 数据集表关系说明，以 SQL 注释形式注入 prompt，帮助 LLM 正确编写 JOIN
 OLIST_RELATIONSHIPS = [
@@ -81,7 +85,7 @@ class DataSource:
 
     # ── 核心查询 ──────────────────────────────────────────────────────────────
 
-    def query(self, sql: str) -> pd.DataFrame:
+    def query(self, sql: str, hidden_tables: set = None) -> pd.DataFrame:
         """
         执行 SQL 查询，返回 pandas DataFrame。
 
@@ -94,6 +98,8 @@ class DataSource:
         ----------
         sql : str
             合法的 DuckDB SQL 语句。
+        hidden_tables : set, optional
+            当前会话中已隐藏的表名集合。SQL 引用隐藏表时抛出 ValueError。
 
         Returns
         -------
@@ -103,15 +109,27 @@ class DataSource:
         Raises
         ------
         ValueError
-            当 SQL 执行出错时抛出，错误信息包含原始 SQL 和数据库报错，
-            方便调试和向用户展示。
+            当 SQL 执行出错，或 SQL 引用了隐藏表时抛出。
         """
         if not sql or not sql.strip():
             raise ValueError("SQL 语句不能为空。")
 
+        hidden = hidden_tables or set()
+        if hidden:
+            sql_lower = sql.lower()
+            for table in hidden:
+                pattern = r'\b' + re.escape(table.lower()) + r'\b'
+                if re.search(pattern, sql_lower):
+                    raise ValueError(
+                        f"表 '{table}' 在当前会话中已被隐藏，无法查询。\n"
+                        f"刷新页面后可恢复该表。"
+                    )
+
         try:
             result = self.conn.execute(sql).fetchdf()
             return result
+        except ValueError:
+            raise
         except Exception as e:
             raise ValueError(
                 f"SQL 执行失败。\n"
@@ -121,9 +139,9 @@ class DataSource:
 
     # ── Schema 信息 ───────────────────────────────────────────────────────────
 
-    def get_schema(self) -> str:
+    def get_schema(self, hidden_tables: set = None) -> str:
         """
-        返回所有表的 schema 文本，格式专为 LLM prompt 设计。
+        返回所有可见表的 schema 文本，格式专为 LLM prompt 设计。
 
         输出示例：
             表名: orders
@@ -137,11 +155,17 @@ class DataSource:
             - 不包含行数统计（节省 token），行数可用 list_tables() 单独获取
             - Week 2 直接将此文本插入 system prompt 的 "数据库结构" 部分
 
+        Parameters
+        ----------
+        hidden_tables : set, optional
+            当前会话中已隐藏的表名集合，这些表将从 schema 中排除。
+
         Returns
         -------
         str
-            所有表的 schema 拼接文本。如果没有任何表，返回提示字符串。
+            所有可见表的 schema 拼接文本。如果没有任何表，返回提示字符串。
         """
+        hidden = hidden_tables or set()
         try:
             # 从 information_schema 获取所有用户表的字段信息
             # 排除 DuckDB 内置的 system schema
@@ -158,9 +182,11 @@ class DataSource:
             if df.empty:
                 return "（当前数据库中没有任何表）"
 
-            # 按表名分组，拼接成易读的文本格式
+            # 按表名分组，拼接成易读的文本格式，跳过隐藏表
             lines = []
             for table_name, group in df.groupby("table_name", sort=True):
+                if table_name in hidden:
+                    continue
                 # 每个字段格式：字段名 (类型)
                 cols = ", ".join(
                     f"{row['column_name']} ({row['data_type']})"
@@ -170,6 +196,9 @@ class DataSource:
                 lines.append(f"字段: {cols}")
                 lines.append("")  # 表与表之间空一行，提升可读性
 
+            if not lines:
+                return "（当前会话中没有可见的数据表）"
+
             return "\n".join(lines).strip()
 
         except Exception as e:
@@ -178,7 +207,7 @@ class DataSource:
 
     # ── 表名列表 ──────────────────────────────────────────────────────────────
 
-    def list_tables(self) -> list[str]:
+    def list_tables(self, hidden_tables: set = None) -> list[str]:
         """
         返回当前数据库中所有可查询的表名（含通过上传注册的临时视图）。
 
@@ -186,11 +215,17 @@ class DataSource:
           - Sidebar 展示"当前可用数据源"
           - Week 2 可以让 LLM 先确认表名再生成 SQL，减少幻觉
 
+        Parameters
+        ----------
+        hidden_tables : set, optional
+            当前会话中已隐藏的表名集合，这些表将从结果中排除。
+
         Returns
         -------
         list[str]
-            表名列表，按字母排序。出错时返回空列表。
+            可见表名列表，按字母排序。出错时返回空列表。
         """
+        hidden = hidden_tables or set()
         try:
             df = self.conn.execute("""
                 SELECT DISTINCT table_name
@@ -199,12 +234,50 @@ class DataSource:
                 ORDER BY table_name
             """).fetchdf()
 
-            return df["table_name"].tolist()
+            return [t for t in df["table_name"].tolist() if t not in hidden]
 
         except Exception as e:
             # 返回空列表而非抛出异常，让调用方可以安全处理
             print(f"[DataSource] list_tables 失败: {e}")
             return []
+
+    def get_table_info(self, hidden_tables: set = None) -> list[dict]:
+        """
+        返回每张可见表的详细信息，用于 Sidebar UI 展示。
+
+        Parameters
+        ----------
+        hidden_tables : set, optional
+            当前会话中已隐藏的表名集合。
+
+        Returns
+        -------
+        list[dict]
+            每个元素格式：
+            {'name': str, 'type': 'builtin'|'uploaded',
+             'row_count': int, 'col_count': int, 'columns': list[str]}
+        """
+        hidden = hidden_tables or set()
+        result = []
+        for table in self.list_tables(hidden_tables=hidden):
+            try:
+                row_count = self.conn.execute(
+                    f'SELECT COUNT(*) FROM "{table}"'
+                ).fetchone()[0]
+                columns = [
+                    col[0]
+                    for col in self.conn.execute(f'DESCRIBE "{table}"').fetchall()
+                ]
+                result.append({
+                    "name": table,
+                    "type": "builtin" if table in OLIST_BUILTIN_TABLES else "uploaded",
+                    "row_count": row_count,
+                    "col_count": len(columns),
+                    "columns": columns,
+                })
+            except Exception:
+                continue
+        return result
 
     # ── 文件上传 ──────────────────────────────────────────────────────────────
 
@@ -275,13 +348,15 @@ class DataSource:
 
     def _cleanup_uploaded_tables(self) -> None:
         """
-        启动时扫描 olist.db，删除所有非 olist 原始表。
+        清理所有非 Olist 的用户上传表/视图。
 
-        解决问题：上次会话用 CREATE TABLE 方式写入的用户上传表，
-        在服务重启后 session_state 已清空但数据库里仍残留，
-        导致"当前数据表"出现无法删除的陌生表名。
+        在两种场景下调用：
+          1. DataSource.__init__（服务首次启动）：清理上次进程残留的 CREATE TABLE
+          2. main() 检测到新 session 时：清理上次会话 conn.register() 的内存视图
 
-        规则：表名不在 OLIST_TABLES 集合里的，全部 DROP。
+        规则：表名不在 OLIST_TABLES 集合里的，全部清除。
+        对 conn.register() 注册的内存视图必须用 unregister()，DROP VIEW 对其无效，
+        因此统一走 _unregister_view()（先 unregister 再 DROP VIEW 双重保险）。
         """
         try:
             rows = self.conn.execute("""
@@ -292,8 +367,8 @@ class DataSource:
 
             for t in rows:
                 if t not in OLIST_TABLES:
-                    self.conn.execute(f'DROP TABLE IF EXISTS "{t}"')
-                    self.conn.execute(f'DROP VIEW IF EXISTS "{t}"')
+                    self._unregister_view(t)                    # 清理 register() 视图
+                    self.conn.execute(f'DROP TABLE IF EXISTS "{t}"')  # 清理 CREATE TABLE
         except Exception:
             pass  # 清理失败不影响启动
 
@@ -331,7 +406,7 @@ class DataSource:
 
     # ── 增强 Schema（含表关系）────────────────────────────────────────────────
 
-    def get_schema_with_relationships(self) -> str:
+    def get_schema_with_relationships(self, hidden_tables: set = None) -> str:
         """
         返回带表关系注释的 schema 文本，专为 NL2SQL prompt 设计。
 
@@ -339,9 +414,14 @@ class DataSource:
         表关系说明（SQL 注释格式），帮助 LLM 在涉及多表时选择正确的 JOIN 键。
 
         对于用户上传的自定义表，只追加基础 schema，不附加关系注释。
+
+        Parameters
+        ----------
+        hidden_tables : set, optional
+            当前会话中已隐藏的表名集合，透传给 get_schema()。
         """
         rel_text = "\n".join(OLIST_RELATIONSHIPS)
-        schema   = self.get_schema()
+        schema   = self.get_schema(hidden_tables=hidden_tables)
         return f"【表关系说明】\n{rel_text}\n\n【表结构详情】\n{schema}"
 
     def estimate_row_count(self, sql: str) -> int:

@@ -18,6 +18,7 @@ Agent 主循环：基于 DeepSeek Function Calling 实现多步推理。
 
 import json
 import re
+import streamlit as st
 from openai import OpenAI
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, MODEL_NAME, LARGE_QUERY_ROW_THRESHOLD
@@ -400,8 +401,31 @@ def run_agent(
     """
     client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
-    schema_text = ds.get_schema_with_relationships()
-    system_content = AGENT_SYSTEM_PROMPT.format(schema_text=schema_text)
+    # ── 读取当前会话的隐藏表集合，过滤 schema 并注入数据状态上下文 ────────────
+    hidden = set(st.session_state.get("hidden_tables", set()))
+    schema_text = ds.get_schema_with_relationships(hidden_tables=hidden)
+    visible_tables = ds.list_tables(hidden_tables=hidden)
+
+    if visible_tables:
+        data_context = (
+            f"\n\n【当前会话可用数据表】\n"
+            f"共 {len(visible_tables)} 张表：{', '.join(visible_tables)}\n"
+            f"查询时只能使用以上表名。"
+        )
+        if hidden:
+            data_context += (
+                f"\n本次会话中以下表已被隐藏不可用：{', '.join(sorted(hidden))}"
+            )
+    else:
+        data_context = (
+            "\n\n【当前数据状态】\n"
+            "⚠️ 当前会话中没有任何可用的数据表。\n"
+            "请直接告知用户：所有数据在本次会话已被隐藏或尚未上传数据。\n"
+            "刷新页面可恢复内置数据，或引导用户上传文件。\n"
+            "禁止调用 query_database 工具或生成任何 SQL。"
+        )
+
+    system_content = AGENT_SYSTEM_PROMPT.format(schema_text=schema_text) + data_context
 
     # ── 构建 messages ───────────────────────────────────────────────────────
     messages = [{"role": "system", "content": system_content}]

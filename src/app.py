@@ -29,7 +29,7 @@ SRC_DIR      = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SRC_DIR)
 sys.path.insert(0, SRC_DIR)
 
-from data_source import DataSource
+from data_source import DataSource, OLIST_BUILTIN_TABLES
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, MODEL_NAME, MAX_TOKENS
 from prompts import build_fix_prompt
 from agent import run_agent
@@ -102,6 +102,92 @@ def _parse_sql_meta(sql: str) -> dict:
     return {"tables": tables, "has_join": has_join}
 
 
+# ── 会话级隐藏机制辅助函数 ────────────────────────────────────────────────────
+
+def get_hidden_tables() -> set:
+    """获取当前会话中被隐藏的表名集合，无记录时返回空集合。"""
+    return set(st.session_state.get("hidden_tables", set()))
+
+
+def hide_table(table_name: str) -> None:
+    """把单张表加入隐藏列表（不修改数据库）。"""
+    if "hidden_tables" not in st.session_state:
+        st.session_state["hidden_tables"] = set()
+    st.session_state["hidden_tables"].add(table_name)
+
+
+def hide_all_tables(data_source: DataSource) -> None:
+    """隐藏当前所有可见表（含内置和上传）。绕过 list_tables 过滤，直接读 DuckDB 真实表列表。"""
+    all_real_tables = _get_real_all_tables(data_source)
+    st.session_state["hidden_tables"] = set(all_real_tables)
+
+
+def hide_olist_tables(data_source: DataSource) -> None:
+    """只隐藏 Olist 内置表，保留用户上传的表。"""
+    if "hidden_tables" not in st.session_state:
+        st.session_state["hidden_tables"] = set()
+    all_real_tables = _get_real_all_tables(data_source)
+    olist_to_hide = all_real_tables & OLIST_BUILTIN_TABLES
+    st.session_state["hidden_tables"].update(olist_to_hide)
+
+
+def _get_real_all_tables(data_source: DataSource) -> set:
+    """直接从 DuckDB 获取所有实际存在的表（不经过 hidden 过滤），用于隐藏/恢复操作。"""
+    try:
+        rows = data_source.conn.execute("SHOW TABLES").fetchall()
+        return {row[0] for row in rows}
+    except Exception:
+        return set()
+
+
+def _sync_state_after_hide(hidden_table_names: list) -> None:
+    """
+    隐藏一批表后，清理 session_state 中引用了这些表的缓存。
+    不清除 messages（保留对话历史）。
+    """
+    hidden_set = set(hidden_table_names)
+
+    # 清理 query_results 中引用了被隐藏表的条目
+    query_results = st.session_state.get("query_results", {})
+    keys_to_remove = []
+    for key, val in query_results.items():
+        sql = val.get("sql", "").lower()
+        for table in hidden_set:
+            pattern = r"\b" + re.escape(table.lower()) + r"\b"
+            if re.search(pattern, sql):
+                keys_to_remove.append(key)
+                break
+    for key in keys_to_remove:
+        query_results.pop(key, None)
+
+    # 如果 latest_query_key 指向被移除的缓存，重置
+    if st.session_state.get("latest_query_key") in keys_to_remove:
+        st.session_state["latest_query_key"] = None
+
+    # 清理 chart_registry 中基于被隐藏表数据的图表（用 caption 模糊匹配）
+    chart_reg = st.session_state.get("chart_registry", [])
+    st.session_state["chart_registry"] = [
+        c for c in chart_reg
+        if not any(table in c.get("caption", "").lower() for table in hidden_set)
+    ]
+
+
+def _insert_system_message(content: str) -> None:
+    """在对话历史中插入一条 assistant 系统提示消息，告知用户数据状态变化。"""
+    if "messages" not in st.session_state:
+        st.session_state["messages"] = []
+    st.session_state["messages"].append({"role": "assistant", "content": content})
+
+
+def _format_row_count(n: int) -> str:
+    """把数字格式化为易读字符串：99441 → '99.4K行'，1500000 → '1.5M行'。"""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M行"
+    elif n >= 1_000:
+        return f"{n / 1_000:.1f}K行"
+    return f"{n}行"
+
+
 # ── 初始化 Session State ──────────────────────────────────────────────────────
 def init_session_state() -> None:
     """
@@ -158,6 +244,253 @@ def init_session_state() -> None:
     if "_report_output" not in st.session_state:
         st.session_state["_report_output"] = []
 
+    # 会话级隐藏表集合（刷新页面后自动重置为空，底层数据库不变）
+    if "hidden_tables" not in st.session_state:
+        st.session_state["hidden_tables"] = set()
+
+
+# ── 数据管理 Sidebar（新版：支持会话级隐藏）────────────────────────────────────
+def render_data_management_sidebar(ds: DataSource) -> None:
+    """
+    渲染 Sidebar 的数据管理区域。
+    包含：数据表列表（含×隐藏按钮）、两个批量隐藏按钮、字段详情、文件上传。
+    """
+    hidden = get_hidden_tables()
+    table_infos = ds.get_table_info(hidden_tables=hidden)
+
+    st.sidebar.markdown("**当前数据表**")
+
+    # ── 1. 数据表列表 ─────────────────────────────────────────────────────────
+    if not table_infos:
+        st.sidebar.info(
+            "📭 **当前无可见数据**\n\n"
+            "所有数据表已在本次会话中隐藏。\n"
+            "刷新页面可恢复所有数据。"
+        )
+    else:
+        for info in table_infos:
+            col_icon, col_name, col_meta, col_del = st.sidebar.columns(
+                [0.25, 2.0, 1.8, 0.35]
+            )
+            with col_icon:
+                icon = "🗄️" if info["type"] == "builtin" else "📄"
+                st.write(icon)
+            with col_name:
+                st.write(f"**{info['name']}**")
+            with col_meta:
+                row_str = _format_row_count(info["row_count"])
+                badge_color = "#1B3A6B" if info["type"] == "builtin" else "#E87722"
+                badge_text = "内置" if info["type"] == "builtin" else "上传"
+                st.markdown(
+                    f'<span style="background:{badge_color};color:white;'
+                    f'font-size:10px;padding:1px 6px;border-radius:3px;'
+                    f'font-weight:600">{badge_text}</span> '
+                    f'<span style="font-size:11px;color:#6B7280">{row_str}</span>',
+                    unsafe_allow_html=True,
+                )
+            with col_del:
+                is_uploaded = info["type"] == "uploaded"
+                btn_help = (
+                    f"在本次会话中删除表 {info['name']}"
+                    if is_uploaded
+                    else f"在本次会话中隐藏表 {info['name']}"
+                )
+                if st.button(
+                    "×",
+                    key=f"hide_table_{info['name']}",
+                    help=btn_help,
+                ):
+                    if is_uploaded:
+                        st.session_state["pending_delete_table"] = info["name"]
+                    else:
+                        st.session_state["pending_hide_table"] = info["name"]
+
+    # ── 上传表删除确认（直接 unregister，不可通过刷新恢复）────────────────────
+    pending_del = st.session_state.get("pending_delete_table")
+    if pending_del:
+        st.sidebar.warning(
+            f"删除表 **{pending_del}**？\n\n"
+            f"本次会话中将无法查询该表，刷新页面后也不会恢复。"
+        )
+        col_y, col_n = st.sidebar.columns(2)
+        with col_y:
+            if st.button(
+                "确认删除",
+                key="confirm_delete_single",
+                type="primary",
+                use_container_width=True,
+            ):
+                ds.unload_view(pending_del)
+                st.session_state.get("uploaded_tables", {}).pop(
+                    next(
+                        (k for k, v in st.session_state.get("uploaded_tables", {}).items() if v == pending_del),
+                        None,
+                    ),
+                    None,
+                )
+                _sync_state_after_hide([pending_del])
+                st.session_state.pop("pending_delete_table", None)
+                st.sidebar.toast(f"✅ {pending_del} 已删除")
+                st.rerun()
+        with col_n:
+            if st.button(
+                "取消", key="cancel_delete_single", use_container_width=True
+            ):
+                st.session_state.pop("pending_delete_table", None)
+                st.rerun()
+
+    # ── 内置表隐藏确认（session-level hiding，刷新后恢复）────────────────────
+    pending = st.session_state.get("pending_hide_table")
+    if pending:
+        st.sidebar.warning(
+            f"隐藏表 **{pending}**？\n\n"
+            f"本次会话中将无法查询该表，刷新页面后恢复。"
+        )
+        col_y, col_n = st.sidebar.columns(2)
+        with col_y:
+            if st.button(
+                "确认隐藏",
+                key="confirm_hide_single",
+                type="primary",
+                use_container_width=True,
+            ):
+                hide_table(pending)
+                _sync_state_after_hide([pending])
+                st.session_state.pop("pending_hide_table", None)
+                st.sidebar.toast(f"✅ {pending} 已在本会话中隐藏")
+                st.rerun()
+        with col_n:
+            if st.button(
+                "取消", key="cancel_hide_single", use_container_width=True
+            ):
+                st.session_state.pop("pending_hide_table", None)
+                st.rerun()
+
+    # ── 2. 字段详情展开 ───────────────────────────────────────────────────────
+    if table_infos:
+        with st.sidebar.expander("查看字段详情", expanded=False):
+            for info in table_infos:
+                st.markdown(f"**{info['name']}** （{info['col_count']} 列）")
+                preview_cols = info["columns"][:6]
+                more = info["col_count"] - 6
+                suffix = f"…等 {info['col_count']} 列" if more > 0 else ""
+                st.caption("、".join(preview_cols) + suffix)
+
+    # ── 3. 两个批量隐藏按钮 ──────────────────────────────────────────────────
+    st.sidebar.divider()
+    col_all, col_olist = st.sidebar.columns(2)
+
+    with col_all:
+        all_disabled = len(table_infos) == 0
+        if st.button(
+            "🗑️ 清除所有",
+            key="btn_hide_all",
+            help="在本次会话中隐藏所有数据表（刷新后恢复）",
+            disabled=all_disabled,
+            use_container_width=True,
+        ):
+            st.session_state["confirm_hide_all"] = True
+
+    with col_olist:
+        visible_olist = [t for t in table_infos if t["type"] == "builtin"]
+        olist_disabled = len(visible_olist) == 0
+        if st.button(
+            "📦 仅隐藏Olist",
+            key="btn_hide_olist",
+            help="只隐藏 Olist 内置数据，保留你上传的文件（刷新后恢复）",
+            disabled=olist_disabled,
+            use_container_width=True,
+        ):
+            st.session_state["confirm_hide_olist"] = True
+
+    # ── 清除所有确认 ──────────────────────────────────────────────────────────
+    if st.session_state.get("confirm_hide_all"):
+        st.sidebar.warning("⚠️ 将隐藏所有数据表，包括你上传的文件")
+        col_y, col_n = st.sidebar.columns(2)
+        with col_y:
+            if st.button(
+                "确认", key="confirm_all_yes", type="primary", use_container_width=True
+            ):
+                names_before = [t["name"] for t in table_infos]
+                hide_all_tables(ds)
+                _sync_state_after_hide(names_before)
+                _insert_system_message(
+                    "🗑️ **所有数据表已在本次会话中隐藏。**\n\n"
+                    "当前没有可查询的数据。请上传你的数据文件，\n"
+                    "或刷新页面恢复 Olist 内置数据集。"
+                )
+                st.session_state.pop("confirm_hide_all", None)
+                st.rerun()
+        with col_n:
+            if st.button("取消", key="confirm_all_no", use_container_width=True):
+                st.session_state.pop("confirm_hide_all", None)
+                st.rerun()
+
+    # ── 仅隐藏 Olist 确认 ─────────────────────────────────────────────────────
+    if st.session_state.get("confirm_hide_olist"):
+        uploaded_count = len([t for t in table_infos if t["type"] == "uploaded"])
+        st.sidebar.info(
+            f"将隐藏 {len(visible_olist)} 张 Olist 内置表，\n"
+            f"保留 {uploaded_count} 张上传文件"
+        )
+        col_y, col_n = st.sidebar.columns(2)
+        with col_y:
+            if st.button(
+                "确认",
+                key="confirm_olist_yes",
+                type="primary",
+                use_container_width=True,
+            ):
+                olist_names = [t["name"] for t in visible_olist]
+                hide_olist_tables(ds)
+                _sync_state_after_hide(olist_names)
+                _insert_system_message(
+                    "📦 **Olist 内置数据已在本次会话中隐藏。**\n\n"
+                    "你上传的文件仍然可用。\n"
+                    "刷新页面可恢复 Olist 数据。"
+                )
+                st.session_state.pop("confirm_hide_olist", None)
+                st.rerun()
+        with col_n:
+            if st.button("取消", key="confirm_olist_no", use_container_width=True):
+                st.session_state.pop("confirm_hide_olist", None)
+                st.rerun()
+
+    # ── 4. 已隐藏提示 ─────────────────────────────────────────────────────────
+    if hidden:
+        st.sidebar.caption(
+            f"ℹ️ 本次会话已隐藏 {len(hidden)} 张表。刷新页面后自动恢复。"
+        )
+
+    # ── 5. 文件上传 ───────────────────────────────────────────────────────────
+    st.sidebar.divider()
+    uploaded_files = st.sidebar.file_uploader(
+        "📁 上传数据文件",
+        type=["xlsx", "csv"],
+        accept_multiple_files=True,
+        help="支持 Excel（.xlsx）和 CSV 文件，上传后立即可用",
+    )
+    if uploaded_files:
+        newly_loaded = False
+        for f in uploaded_files:
+            existing_table = st.session_state.get("uploaded_tables", {}).get(f.name)
+            # 已加载且当前可见（未隐藏）→ 跳过，避免重复注册
+            if existing_table and existing_table not in get_hidden_tables():
+                continue
+            # 新文件，或同名文件曾被隐藏 → 重新注册（重新激活）
+            try:
+                table_name = ds.load_uploaded_file(f)
+                if table_name:
+                    if table_name in get_hidden_tables():
+                        st.session_state["hidden_tables"].discard(table_name)
+                    st.session_state.setdefault("uploaded_tables", {})[f.name] = table_name
+                    newly_loaded = True
+                    st.sidebar.success(f"✅ {f.name} → 表 `{table_name}`")
+            except ValueError as e:
+                st.sidebar.error(f"❌ 上传失败：{f.name}\n\n{e}")
+        if newly_loaded:
+            st.rerun()
+
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 def render_sidebar(ds: DataSource) -> None:
@@ -187,102 +520,8 @@ def render_sidebar(ds: DataSource) -> None:
 
         st.divider()
 
-        # ── 区域 1：Schema 展示 ──────────────────────────────────────────────
-        st.subheader("🗂️ 当前数据表")
-
-        tables = ds.list_tables()
-        if tables:
-            MAX_LEN = 19
-
-            def make_item(name: str) -> str:
-                display = name[:MAX_LEN] + "…" if len(name) > MAX_LEN else name
-                return (
-                    f'<div title="{name}" style="cursor:default;white-space:nowrap;'
-                    f'padding:1px 0;">'
-                    f'• {display}</div>'
-                )
-
-            items_html = "".join(make_item(t) for t in tables)
-            st.markdown(
-                f'<div style="display:grid;grid-template-columns:1fr 1fr;'
-                f'font-size:0.85rem;color:rgb(120,120,130);line-height:1.6">'
-                f'{items_html}</div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.caption("（暂无可用数据表）")
-
-        with st.expander("📋 查看完整字段结构", expanded=False):
-            try:
-                schema_df = ds.query("""
-                    SELECT table_name, column_name, data_type
-                    FROM information_schema.columns
-                    WHERE table_schema = 'main'
-                    ORDER BY table_name, ordinal_position
-                """)
-                for tname, group in schema_df.groupby("table_name", sort=True):
-                    fields = " | ".join(
-                        f"{r['column_name']} *({r['data_type']})*"
-                        for _, r in group.iterrows()
-                    )
-                    st.caption(f"**{tname}**")
-                    st.caption(fields)
-            except Exception:
-                st.caption(ds.get_schema())
-
-        st.divider()
-
-        # ── 区域 2：文件上传 ─────────────────────────────────────────────────
-        st.subheader("📁 上传自定义数据")
-        st.caption("支持 .csv 和 .xlsx 格式，可同时上传多个文件")
-
-        if st.session_state.uploaded_tables:
-            st.caption("**已加载文件**（点击 🗑️ 可彻底删除数据）**：**")
-            for fname, vname in list(st.session_state.uploaded_tables.items()):
-                col_name, col_btn = st.columns([5, 1])
-                display = fname[:22] + "…" if len(fname) > 22 else fname
-                col_name.caption(f"• {display}")
-                if col_btn.button("🗑️", key=f"del_{fname}", help=f"彻底删除「{fname}」的数据"):
-                    ds.unload_view(vname)
-                    del st.session_state.uploaded_tables[fname]
-                    st.session_state.deleted_files.add(fname)
-                    st.rerun()
-
-        uploaded_files = st.file_uploader(
-            label="选择文件",
-            type=["csv", "xlsx"],
-            accept_multiple_files=True,
-            label_visibility="collapsed",
-        )
-
-        current_filenames = {f.name for f in uploaded_files} if uploaded_files else set()
-        st.session_state.deleted_files = {
-            f for f in st.session_state.deleted_files if f in current_filenames
-        }
-
-        newly_loaded = False
-        if uploaded_files:
-            for file in uploaded_files:
-                if file.name in st.session_state.uploaded_tables:
-                    continue
-                if file.name in st.session_state.deleted_files:
-                    continue
-                try:
-                    view_name = ds.load_uploaded_file(file)
-                    st.session_state.uploaded_tables[file.name] = view_name
-                    newly_loaded = True
-                    st.markdown(
-                        f'<div style="background:#d4edda;border:1px solid #c3e6cb;'
-                        f'border-radius:4px;padding:5px 10px;'
-                        f'font-size:0.75rem;color:#155724;line-height:1.5">'
-                        f'✅ 已加载：{file.name} → 表名「{view_name}」</div>',
-                        unsafe_allow_html=True,
-                    )
-                except ValueError as e:
-                    st.error(f"❌ 上传失败：{file.name}\n\n{e}")
-
-        if newly_loaded:
-            st.rerun()
+        # ── 区域 1+2：数据表管理 + 文件上传（新版）──────────────────────────
+        render_data_management_sidebar(ds)
 
         # ── 区域 3：历史 SQL 记录 ────────────────────────────────────────────
         if st.session_state.sql_history:
@@ -774,7 +1013,7 @@ def _render_pending(ds: DataSource) -> None:
             with col_ok:
                 if st.button("✅ 确认执行", type="primary", key="btn_confirm"):
                     try:
-                        df      = ds.query(pending["sql"])
+                        df      = ds.query(pending["sql"], hidden_tables=get_hidden_tables())
                         intent  = pending.get("intent", pending["question"])
 
                         # 存入 query_results，供后续工具引用
@@ -1024,8 +1263,13 @@ def _run_and_store_agent(user_input: str, ds: DataSource) -> None:
 
 # ── 程序入口 ──────────────────────────────────────────────────────────────────
 def main() -> None:
+    is_fresh_session = "uploaded_tables" not in st.session_state
     init_session_state()
     ds = get_data_source()
+    if is_fresh_session:
+        # 刷新页面 = 新 session，但 @cache_resource 的 DuckDB 连接跨刷新存活。
+        # 主动清理上次会话注册的用户上传视图，确保刷新后只剩 Olist 9 张表。
+        ds._cleanup_uploaded_tables()
     render_sidebar(ds)
     render_chat(ds)
 
