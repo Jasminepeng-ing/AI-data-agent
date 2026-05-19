@@ -9,7 +9,7 @@
 **用自然语言提问，AI 自动完成数据查询、可视化分析、专业报告生成的全流程 Agent。**
 
 > 一个由数据分析师亲手打造、面向分析师痛点的 AI 自动化分析工具。
-> Demo：https://ai-data-agent-wfccrsapp3yggd8owtvdk82.streamlit.app/
+> Demo：https://jasmine-data-aiagent.streamlit.app/
 
 ---
 
